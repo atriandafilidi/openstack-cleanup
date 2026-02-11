@@ -6,7 +6,8 @@
 #                                                                             #
 # This is a comprehensive cleanup script for OpenStack resources. It can      #
 # delete compute instances, networks, volumes, load balancers, Heat stacks,   #
-# and other resources matching a specified filter pattern.                    #
+# Identity application credentials, and other resources matching a specified  #
+# filter pattern.                                                             #
 #                                                                             #
 # Usage examples:                                                             #
 #     $ python3 openstack_cleanup.py --filter ".*test-cluster.*" --dryrun     #
@@ -1074,6 +1075,75 @@ class AdvancedServicesCleaner(AbstractCleaner):
             except Exception as e:
                 print(f'    . Could not clean DNS zones: {str(e)}')
 
+
+def _get_current_user_id(session):
+    """Current user ID from session auth (same as 'openstack application credential list')."""
+    try:
+        if getattr(session, 'auth', None) and hasattr(session.auth, 'get_user_id'):
+            return session.auth.get_user_id(session)
+    except Exception:
+        pass
+    return None
+
+
+def _get_in_use_app_cred_id(conn):
+    """ID of the application credential used for this session, or empty string."""
+    ac_id = (os.environ.get('OS_APPLICATION_CREDENTIAL_ID') or '').strip()
+    if not ac_id and getattr(conn, 'auth', None):
+        auth_ref = getattr(conn.auth, 'auth_ref', None)
+        ac_id = (getattr(auth_ref, 'application_credential_id', None) or '').strip()
+    return ac_id
+
+
+class IdentityCleaner(AbstractCleaner):
+    """
+    Cleaner for Identity (Keystone) application credentials for the current user.
+    Skips the credential used for this session to avoid locking out.
+    """
+
+    def __init__(self, sess, resources, dryrun):
+        self.conn = openstack.connection.Connection(session=sess)
+        self._user_id = _get_current_user_id(sess)
+        self._in_use_cred_id = _get_in_use_app_cred_id(self.conn)
+
+        res_desc = {}
+        if self._user_id:
+            conn, uid = self.conn, self._user_id
+            res_desc['application_credentials'] = [
+                lambda c=conn, u=uid: list(c.identity.application_credentials(u))
+            ]
+        else:
+            print('    . Identity: skipped (could not get current user ID)')
+
+        super(IdentityCleaner, self).__init__('Identity', res_desc, resources, dryrun)
+
+    def clean(self):
+        if not self._user_id:
+            return
+        app_creds = self.resources.get('application_credentials', {})
+        if not app_creds:
+            return
+
+        print('*** IDENTITY (application credentials) cleanup')
+        for cred_id, cred_name in app_creds.items():
+            if cred_id == self._in_use_cred_id:
+                print(f'    ⏭️  APPLICATION CREDENTIAL {cred_name} skipped (in use for this session)')
+                continue
+            try:
+                if self.dryrun:
+                    self.conn.identity.get_application_credential(self._user_id, cred_id)
+                    self.report_deletion('APPLICATION CREDENTIAL', cred_name)
+                else:
+                    self.conn.identity.delete_application_credential(
+                        self._user_id, cred_id, ignore_missing=True
+                    )
+                    self.report_deletion('APPLICATION CREDENTIAL', cred_name)
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('APPLICATION CREDENTIAL', cred_name)
+            except Exception as e:
+                self.report_error('APPLICATION CREDENTIAL', cred_name, str(e))
+
+
 class OpenStackCleaners():
 
     def __init__(self, creds_obj, resources, dryrun):
@@ -1084,7 +1154,7 @@ class OpenStackCleaners():
         # Initialize resource monitor
         self.monitor = ResourceMonitor(sess, dryrun)
         
-        for cleaner_type in [AdvancedServicesCleaner, ComputeCleaner, StorageCleaner, LoadBalancerCleaner, NetworkCleaner]:
+        for cleaner_type in [AdvancedServicesCleaner, ComputeCleaner, StorageCleaner, LoadBalancerCleaner, NetworkCleaner, IdentityCleaner]:
             cleaner = cleaner_type(sess, resources, dryrun)
             # Pass monitor to cleaner if it supports it
             if hasattr(cleaner, 'set_monitor'):
@@ -1110,7 +1180,8 @@ class OpenStackCleaners():
             cleaner.clean()
 
 # Here's how we store what needs to be cleaned up:
-# First level keys are service types like: flavors, keypairs, users, routers, floating_ips, instances, volumes, etc.
+# First level keys are service types: flavors, keypairs, application_credentials,
+# users, routers, floating_ips, instances, volumes, etc.
 # Second level keys are the actual resource IDs  
 # Values are the human-readable names (e.g. 'TEST-instance-1', 'DEV-network-2')
 def get_resources_from_cleanup_log(logfile):
