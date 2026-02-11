@@ -970,110 +970,81 @@ class LoadBalancerCleaner(AbstractCleaner):
         except KeyError:
             pass
 
-class AdvancedServicesCleaner(AbstractCleaner):
-    """
-    Cleaner for additional OpenStack services like DNS, VPN, Firewall, etc.
-    """
+class DnsCleaner(AbstractCleaner):
+    """Cleaner for DNS (Designate) zones."""
 
     def __init__(self, sess, resources, dryrun):
-        self.session = sess
-        
-        # Initialize OpenStack SDK connection
         self.conn = openstack.connection.Connection(session=sess)
-        
-        # Try to import additional service clients
-        self.available_services = {}
-        
-        # Try DNS (Designate)
-        try:
-            # Test if DNS service is available via SDK
-            list(self.conn.dns.zones(limit=1))
-            self.available_services['dns'] = True
-        except Exception:
-            self.available_services['dns'] = False
-
-        # Try Heat (Orchestration)
-        try:
-            # Test if Heat service is available via SDK
-            list(self.conn.orchestration.stacks(limit=1))
-            self.available_services['heat'] = True
-        except Exception:
-            self.available_services['heat'] = False
-
-        # VPN services are not commonly available in OpenStack SDK
-        # Most deployments don't have VPN service, so we'll skip it
-        self.available_services['vpn'] = False
-
-        # Initialize with dynamic resource discovery
         res_desc = {}
-        
-        if self.available_services.get('dns'):
-            def zones_fetcher():
-                return list(self.conn.dns.zones())
-            res_desc['dns_zones'] = [zones_fetcher]
-            
-        if self.available_services.get('heat'):
-            def stacks_fetcher():
-                all_stacks = list(self.conn.orchestration.stacks())
-                # Include all stacks regardless of status and ensure uniqueness by stack ID
-                unique_stacks = {}
-                for stack in all_stacks:
-                    unique_stacks[stack.id] = stack
-                return list(unique_stacks.values())
-            res_desc['heat_stacks'] = [stacks_fetcher]
-            
-        # VPN services are not supported in this SDK-only version
-
-        super(AdvancedServicesCleaner, self).__init__('AdvancedServices', res_desc, resources, dryrun)
+        try:
+            list(self.conn.dns.zones(limit=1))
+            res_desc['dns_zones'] = [lambda c=self.conn: list(c.dns.zones())]
+        except Exception:
+            pass
+        super(DnsCleaner, self).__init__('DNS', res_desc, resources, dryrun)
 
     def clean(self):
-        if not any(self.available_services.values()):
+        if 'dns_zones' not in self.resources:
             return
-            
-        print('*** ADVANCED SERVICES cleanup')
-        global resource_name_re
+        print('*** DNS (Designate) cleanup')
+        try:
+            for zone_id, zone_name in self.resources['dns_zones'].items():
+                try:
+                    if self.dryrun:
+                        self.report_deletion('DNS ZONE', zone_name)
+                    else:
+                        self.conn.dns.delete_zone(zone_id)
+                        self.report_deletion('DNS ZONE', zone_name)
+                except Exception as e:
+                    if "NotFound" in str(e):
+                        self.report_not_found('DNS ZONE', zone_name)
+                    else:
+                        self.report_error('DNS ZONE', zone_name, str(e))
+        except Exception as e:
+            print(f'    . Could not clean DNS zones: {str(e)}')
 
-        # Clean Heat stacks FIRST (they may have created DNS zones)
-        if self.available_services.get('heat'):
-            try:
-                for stack_id, stack_name in self.resources.get('heat_stacks', {}).items():
-                    try:
-                        if self.dryrun:
-                            self.report_deletion('HEAT STACK', stack_name)
-                        else:
-                            # Delete stack and wait for completion
-                            print(f'    . Deleting Heat stack {stack_name} and waiting for completion...')
-                            # Get the stack object first
-                            stack = self.conn.orchestration.get_stack(stack_id)
-                            self.conn.orchestration.delete_stack(stack)
-                            self.conn.orchestration.wait_for_delete(stack)
-                            self.report_deletion('HEAT STACK', stack_name)
-                    except Exception as e:
-                        if "NotFound" in str(e):
-                            self.report_not_found('HEAT STACK', stack_name)
-                        else:
-                            self.report_error('HEAT STACK', stack_name, str(e))
-                            
-            except Exception as e:
-                print(f'    . Could not clean Heat stacks: {str(e)}')
 
-        # Clean DNS zones AFTER Heat stacks
-        if self.available_services.get('dns'):
-            try:
-                for zone_id, zone_name in self.resources.get('dns_zones', {}).items():
-                    try:
-                        if self.dryrun:
-                            self.report_deletion('DNS ZONE', zone_name)
-                        else:
-                            self.conn.dns.delete_zone(zone_id)
-                            self.report_deletion('DNS ZONE', zone_name)
-                    except Exception as e:
-                        if "NotFound" in str(e):
-                            self.report_not_found('DNS ZONE', zone_name)
-                        else:
-                            self.report_error('DNS ZONE', zone_name, str(e))
-            except Exception as e:
-                print(f'    . Could not clean DNS zones: {str(e)}')
+class HeatCleaner(AbstractCleaner):
+    """Cleaner for Heat (orchestration) stacks."""
+
+    def __init__(self, sess, resources, dryrun):
+        self.conn = openstack.connection.Connection(session=sess)
+        res_desc = {}
+        try:
+            list(self.conn.orchestration.stacks(limit=1))
+
+            def stacks_fetcher():
+                all_stacks = list(self.conn.orchestration.stacks())
+                unique_stacks = {s.id: s for s in all_stacks}
+                return list(unique_stacks.values())
+
+            res_desc['heat_stacks'] = [stacks_fetcher]
+        except Exception:
+            pass
+        super(HeatCleaner, self).__init__('Heat', res_desc, resources, dryrun)
+
+    def clean(self):
+        if 'heat_stacks' not in self.resources:
+            return
+        print('*** HEAT (orchestration) cleanup')
+        try:
+            for stack_id, stack_name in self.resources['heat_stacks'].items():
+                try:
+                    if self.dryrun:
+                        self.report_deletion('HEAT STACK', stack_name)
+                    else:
+                        print(f'    . Deleting Heat stack {stack_name} and waiting for completion...')
+                        stack = self.conn.orchestration.get_stack(stack_id)
+                        self.conn.orchestration.delete_stack(stack)
+                        self.conn.orchestration.wait_for_delete(stack)
+                        self.report_deletion('HEAT STACK', stack_name)
+                except Exception as e:
+                    if "NotFound" in str(e):
+                        self.report_not_found('HEAT STACK', stack_name)
+                    else:
+                        self.report_error('HEAT STACK', stack_name, str(e))
+        except Exception as e:
+            print(f'    . Could not clean Heat stacks: {str(e)}')
 
 
 def _get_current_user_id(session):
@@ -1144,25 +1115,41 @@ class IdentityCleaner(AbstractCleaner):
                 self.report_error('APPLICATION CREDENTIAL', cred_name, str(e))
 
 
+# Type names (for --types) and their cleaner classes, in cleanup order
+CLEANER_TYPES = [
+    ('heat', HeatCleaner),                  # orchestration stacks
+    ('dns', DnsCleaner),                    # Designate DNS zones
+    ('compute', ComputeCleaner),            # instances, flavors, keypairs, images
+    ('storage', StorageCleaner),            # volumes, volume_snapshots
+    ('loadbalancer', LoadBalancerCleaner),
+    ('network', NetworkCleaner),            # floating_ips, sec_groups, networks, routers
+    ('identity', IdentityCleaner),          # application_credentials
+]
+
+
 class OpenStackCleaners():
 
-    def __init__(self, creds_obj, resources, dryrun):
+    def __init__(self, creds_obj, resources, dryrun, resource_types=None):
+        """
+        resource_types: if set, only run these cleaners (e.g. ['compute', 'network']).
+        If None or empty, run all cleaners.
+        """
         self.cleaners = []
         self.dryrun = dryrun
         sess = creds_obj.get_session()
-        
-        # Initialize resource monitor
         self.monitor = ResourceMonitor(sess, dryrun)
-        
-        for cleaner_type in [AdvancedServicesCleaner, ComputeCleaner, StorageCleaner, LoadBalancerCleaner, NetworkCleaner, IdentityCleaner]:
-            cleaner = cleaner_type(sess, resources, dryrun)
-            # Pass monitor to cleaner if it supports it
+
+        types_set = set(resource_types) if resource_types else None
+        for type_name, cleaner_class in CLEANER_TYPES:
+            if types_set is not None and type_name not in types_set:
+                continue
+            cleaner = cleaner_class(sess, resources, dryrun)
             if hasattr(cleaner, 'set_monitor'):
                 cleaner.set_monitor(self.monitor)
             self.cleaners.append(cleaner)
 
     def show_resources(self):
-        table = [["Type", "Name", "UUID"]]
+        table = [["Resource type", "Name", "UUID"]]
         for cleaner in self.cleaners:
             table.extend(cleaner.get_resource_list())
         count = len(table) - 1
@@ -1236,6 +1223,11 @@ def main():
                         action='store_true',
                         default=False,
                         help='automatic yes to prompts; assume "yes" as answer to all prompts')
+    parser.add_argument('-t', '--types', dest='types',
+                        action='store', default=None, metavar='types',
+                        help='limit cleanup to these types only (default: all). '
+                             'Types: heat, dns, compute, storage, loadbalancer, network, identity. '
+                             'E.g. -t compute,network')
     opts = parser.parse_args()
 
     # Validate mutual exclusivity
@@ -1243,6 +1235,17 @@ def main():
         print("❌ ERROR: Cannot use both --rc and --cloud options together")
         print("   Use either --rc for openrc file OR --cloud for clouds.yaml")
         return 1
+
+    # Normalize --types: split comma-separated string
+    resource_types = None
+    if opts.types:
+        resource_types = [s.strip().lower() for s in opts.types.split(',') if s.strip()]
+        allowed = {'heat', 'dns', 'compute', 'storage', 'loadbalancer', 'network', 'identity'}
+        invalid = [t for t in resource_types if t not in allowed]
+        if invalid:
+            print(f"❌ ERROR: Invalid type(s): {invalid}")
+            print(f"   Allowed: {', '.join(sorted(allowed))}")
+            return 1
 
     print("🧹 OpenStack Resource Cleanup Tool")
     print("=" * 50)
@@ -1265,6 +1268,11 @@ def main():
         print(f"Authentication: openrc file '{opts.rc}'")
     else:
         print("Authentication: environment variables or default cloud")
+
+    if resource_types:
+        print(f"Types: {', '.join(resource_types)} (only these will be cleaned)")
+    else:
+        print("Types: all")
     print()
 
     cred = Credentials(opts.rc, opts.cloud)
@@ -1318,7 +1326,7 @@ def main():
         resource_name_re = re.compile('.*test-cluster.*')
 
 
-    cleaners = OpenStackCleaners(cred, resources, opts.dryrun)
+    cleaners = OpenStackCleaners(cred, resources, opts.dryrun, resource_types=resource_types)
 
     if opts.dryrun:
         print()
