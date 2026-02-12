@@ -273,15 +273,6 @@ class ResourceMonitor:
 # Global regex pattern gets set by main()
 resource_name_re = None
 
-def is_not_found_error(exception):
-    """Check if an exception represents a 'not found' error."""
-    return "NotFound" in str(type(exception)) or "404" in str(exception)
-
-def is_conflict_error(exception):
-    """Check if an exception represents a conflict error."""
-    return ("ConflictException" in str(type(exception)) or "409" in str(exception) or
-            "Conflict" in str(type(exception)))
-
 def prompt_to_run(auto_approve=False):
     print("Warning: You didn't specify a resource list file as the input. "
           "The script will delete all resources shown above.")
@@ -296,15 +287,14 @@ def fetch_resources(fetcher, options=None):
     """Get OpenStack resources with some basic error handling."""
     try:
         return fetcher(search_opts=options) if options else fetcher()
+    except os_exceptions.ForbiddenException:
+        print('⚠️  Warning: Insufficient permissions to list some resources')
+        return []
+    except os_exceptions.EndpointNotFound:
+        print('⚠️  Warning: Service endpoint not found in catalog (service may be disabled or unavailable)')
+        return []
     except Exception as e:
-        error_msg = str(e)
-        if "403" in error_msg or "Forbidden" in error_msg:
-            if "get_all_tenants" not in error_msg:
-                print(f'ℹ️  Note: Insufficient permissions to list some resources')
-        elif "DiscoveryFailure" in error_msg:
-            print('❌ Authentication failed: Unable to discover OpenStack endpoints')
-        elif not any(keyword in error_msg.lower() for keyword in ['forbidden', '403', 'unauthorized', '401']):
-            print(f'⚠️  Warning: Exception while listing resources: {error_msg}')
+        print(f'⚠️  Warning: Exception while listing resources: {e}')
         return []
 
 def build_resource_dict(res_list):
@@ -481,12 +471,11 @@ class ComputeCleaner(AbstractCleaner):
                     # Delete instance
                     self.conn.compute.delete_server(ins_id)
                     
+            except os_exceptions.ResourceNotFound:
+                deleting_instances.pop(ins_id, None)
+                self.report_not_found('INSTANCE', ins_name)
             except Exception as e:
-                if "NotFound" in str(type(e)) or "404" in str(e):
-                    deleting_instances.pop(ins_id, None)
-                    self.report_not_found('INSTANCE', ins_name)
-                else:
-                    self.report_error('INSTANCE', ins_name, str(e))
+                self.report_error('INSTANCE', ins_name, str(e))
 
         # Wait for instance deletion to complete
         if not self.dryrun and deleting_instances:
@@ -536,10 +525,9 @@ class ComputeCleaner(AbstractCleaner):
             for ins_id in instances_to_check:
                 try:
                     self.conn.compute.get_server(ins_id)
-                except Exception as e:
-                    if "NotFound" in str(type(e)) or "404" in str(e):
-                        ins_name = deleting_instances.pop(ins_id)
-                        self.report_deletion('INSTANCE', ins_name)
+                except os_exceptions.ResourceNotFound:
+                    ins_name = deleting_instances.pop(ins_id)
+                    self.report_deletion('INSTANCE', ins_name)
             
             if deleting_instances and retry_count > 0:
                 time.sleep(2)
@@ -556,11 +544,10 @@ class ComputeCleaner(AbstractCleaner):
                 else:
                     self.conn.compute.delete_flavor(flavor_id)
                     self.report_deletion('FLAVOR', flavor_name)
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('FLAVOR', flavor_name)
             except Exception as e:
-                if "NotFound" in str(type(e)) or "404" in str(e):
-                    self.report_not_found('FLAVOR', flavor_name)
-                else:
-                    self.report_error('FLAVOR', flavor_name, str(e))
+                self.report_error('FLAVOR', flavor_name, str(e))
 
     def _clean_keypairs(self):
         """Clean up keypairs."""
@@ -571,11 +558,10 @@ class ComputeCleaner(AbstractCleaner):
                 else:
                     self.conn.compute.delete_keypair(keypair_name)
                     self.report_deletion('KEYPAIR', keypair_name)
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('KEYPAIR', keypair_name)
             except Exception as e:
-                if "NotFound" in str(type(e)) or "404" in str(e):
-                    self.report_not_found('KEYPAIR', keypair_name)
-                else:
-                    self.report_error('KEYPAIR', keypair_name, str(e))
+                self.report_error('KEYPAIR', keypair_name, str(e))
 
     def _clean_images(self):
         """Clean up images."""
@@ -586,11 +572,10 @@ class ComputeCleaner(AbstractCleaner):
                 else:
                     self.conn.image.delete_image(image_id)
                     self.report_deletion('IMAGE', image_name)
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('IMAGE', image_name)
             except Exception as e:
-                if "NotFound" in str(type(e)) or "404" in str(e):
-                    self.report_not_found('IMAGE', image_name)
-                else:
-                    self.report_error('IMAGE', image_name, str(e))
+                self.report_error('IMAGE', image_name, str(e))
 
 class NetworkCleaner(AbstractCleaner):
 
@@ -641,11 +626,10 @@ class NetworkCleaner(AbstractCleaner):
                 self.conn.network.delete_ip(fip_id)
                 description_info = f" (desc: {fip_description[:DEFAULT_DESCRIPTION_TRUNCATE_LENGTH]}...)" if fip_description else ""
                 self.report_deletion('FLOATING IP', f"{fip_ip}{description_info}")
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('FLOATING IP', fip_ip)
         except Exception as e:
-            if "NotFound" in str(type(e)) or "404" in str(e):
-                self.report_not_found('FLOATING IP', fip_ip)
-            else:
-                self.report_error('FLOATING IP', fip_ip, str(e))
+            self.report_error('FLOATING IP', fip_ip, str(e))
 
     def clean(self):
         print('*** NETWORK cleanup')
@@ -666,11 +650,10 @@ class NetworkCleaner(AbstractCleaner):
                 try:
                     fip = self.conn.network.get_ip(id)
                     self._delete_floating_ip(fip)
+                except os_exceptions.ResourceNotFound:
+                    self.report_not_found('FLOATING IP', name)
                 except Exception as e:
-                    if "NotFound" in str(type(e)) or "404" in str(e):
-                        self.report_not_found('FLOATING IP', name)
-                    else:
-                        self.report_error('FLOATING IP', name, str(e))
+                    self.report_error('FLOATING IP', name, str(e))
         except KeyError:
             pass
 
@@ -717,11 +700,10 @@ class NetworkCleaner(AbstractCleaner):
                                 self.report_deletion('PORT', port_name)
                         else:
                             print(f'    . Skipping {device_owner} port {port_name}')
+                    except os_exceptions.ResourceNotFound:
+                        self.report_not_found('PORT', port_name)
                     except Exception as e:
-                        if "NotFound" in str(type(e)) or "404" in str(e):
-                            self.report_not_found('PORT', port_name)
-                        else:
-                            self.report_error('PORT', port_name, str(e))
+                        self.report_error('PORT', port_name, str(e))
         except Exception as e:
             print(f'    . Could not list ports: {str(e)}')
 
@@ -768,9 +750,12 @@ class NetworkCleaner(AbstractCleaner):
                         except Exception as e:
                             print(f'    . Could not list floating IPs: {str(e)}')
                         
-                        # Give floating IPs a moment to fully disappear
+                        # Give floating IPs a moment to fully disappear (ours or any we deleted earlier)
                         if router_fips:
                             print('    . Waiting for floating IPs to be fully released...')
+                            time.sleep(DEFAULT_ROUTER_FIP_WAIT)
+                        elif router.external_gateway_info:
+                            # FIPs may have been deleted in the floating_ips step; wait for Neutron to see it
                             time.sleep(DEFAULT_ROUTER_FIP_WAIT)
                         
                         # Now remove the gateway (should work better without floating IPs)
@@ -798,13 +783,12 @@ class NetworkCleaner(AbstractCleaner):
                         # Delete the router
                         self.conn.network.delete_router(id)
                     self.report_deletion('ROUTER', name)
+                except os_exceptions.ResourceNotFound:
+                    self.report_not_found('ROUTER', name)
+                except os_exceptions.ConflictException as e:
+                    self.report_error('ROUTER', name, f'Conflict (may have dependencies): {str(e)}')
                 except Exception as e:
-                    if "NotFound" in str(type(e)) or "404" in str(e):
-                        self.report_not_found('ROUTER', name)
-                    elif "Conflict" in str(type(e)) or "409" in str(e):
-                        self.report_error('ROUTER', name, f'Conflict (may have dependencies): {str(e)}')
-                    else:
-                        self.report_error('ROUTER', name, str(e))
+                    self.report_error('ROUTER', name, str(e))
         except KeyError:
             pass
         try:
@@ -823,9 +807,16 @@ class NetworkCleaner(AbstractCleaner):
                                 if remaining_ports:
                                     print(f'    . Network {name} has {len(remaining_ports)} remaining ports, checking...')
                                     for port in remaining_ports:
-                                        # Don't mess with system ports (they get cleaned up by their owners)
-                                        if port.device_owner in ['network:dhcp', 'network:router_interface', 
-                                                               'network:router_gateway', 'network:floatingip']:
+                                        # Skip ports owned by router/DHCP/FIP (cannot be deleted via port API)
+                                        skip_owners = [
+                                            'network:dhcp', 'network:router_interface',
+                                            'network:router_gateway', 'network:floatingip',
+                                            'network:ha_router_replicated_interface',
+                                        ]
+                                        if port.device_owner in skip_owners:
+                                            continue
+                                        if (port.device_owner or '').startswith('network:router') or \
+                                           (port.device_owner or '').startswith('network:ha_router'):
                                             continue
                                         # Try to clean up the stragglers
                                         try:
@@ -839,21 +830,20 @@ class NetworkCleaner(AbstractCleaner):
                             self.conn.network.delete_network(id)
                             self.report_deletion('NETWORK', name)
                             break
-                    except Exception as e:
-                        if "NotFound" in str(type(e)) or "404" in str(e):
-                            self.report_not_found('NETWORK', name)
-                            break
-                        elif ("NetworkInUse" in str(type(e)) or "409" in str(e) or 
-                              "in use" in str(e).lower() or "ports still in use" in str(e).lower()):
-                            retry_count -= 1
-                            if retry_count > 0:
-                                print(f'    . Network {name} still has dependencies, retrying in 5 seconds... ({retry_count} retries left)')
-                                time.sleep(5)
-                            else:
-                                self.report_error('NETWORK', name, f'Still has dependencies after retries: {str(e)}')
+                    except os_exceptions.ResourceNotFound:
+                        self.report_not_found('NETWORK', name)
+                        break
+                    except os_exceptions.ConflictException as e:
+                        retry_count -= 1
+                        if retry_count > 0:
+                            print(f'    . Network {name} still has dependencies, retrying in 5 seconds... ({retry_count} retries left)')
+                            time.sleep(5)
                         else:
-                            self.report_error('NETWORK', name, str(e))
+                            self.report_error('NETWORK', name, f'Still has dependencies after retries: {str(e)}')
                             break
+                    except Exception as e:
+                        self.report_error('NETWORK', name, str(e))
+                        break
         except KeyError:
             pass
 
@@ -875,21 +865,20 @@ class NetworkCleaner(AbstractCleaner):
                             self.conn.network.delete_security_group(id)
                             self.report_deletion('SECURITY GROUP', name)
                             break
-                    except Exception as e:
-                        if "NotFound" in str(type(e)) or "404" in str(e):
-                            self.report_not_found('SECURITY GROUP', name)
-                            break
-                        elif ("Conflict" in str(type(e)) or "409" in str(e) or 
-                              "in use" in str(e).lower()):
-                            retry_count -= 1
-                            if retry_count > 0:
-                                print(f'    . Security group {name} still in use, retrying in 5 seconds... ({retry_count} retries left)')
-                                time.sleep(5)
-                            else:
-                                self.report_error('SECURITY GROUP', name, f'Still in use after retries: {str(e)}')
+                    except os_exceptions.ResourceNotFound:
+                        self.report_not_found('SECURITY GROUP', name)
+                        break
+                    except os_exceptions.ConflictException as e:
+                        retry_count -= 1
+                        if retry_count > 0:
+                            print(f'    . Security group {name} still in use, retrying in 5 seconds... ({retry_count} retries left)')
+                            time.sleep(5)
                         else:
-                            self.report_error('SECURITY GROUP', name, str(e))
+                            self.report_error('SECURITY GROUP', name, f'Still in use after retries: {str(e)}')
                             break
+                    except Exception as e:
+                        self.report_error('SECURITY GROUP', name, str(e))
+                        break
 
 class LoadBalancerCleaner(AbstractCleaner):
 
@@ -956,17 +945,17 @@ class LoadBalancerCleaner(AbstractCleaner):
                     except os_exceptions.ResourceNotFound:
                         self.report_not_found('LOAD BALANCER', name)
                         break
-                    except Exception as e:
-                        if "ConflictException" in str(type(e)) or "409" in str(e):
-                            retry_count -= 1
-                            if retry_count > 0:
-                                print(f'    . Load balancer {name} conflict, retrying in {DEFAULT_LB_RETRY_DELAY} seconds... ({retry_count} retries left)')
-                                time.sleep(DEFAULT_LB_RETRY_DELAY)
-                            else:
-                                self.report_error('LOAD BALANCER', name, f'Conflict after retries: {str(e)}')
+                    except os_exceptions.ConflictException as e:
+                        retry_count -= 1
+                        if retry_count > 0:
+                            print(f'    . Load balancer {name} conflict, retrying in {DEFAULT_LB_RETRY_DELAY} seconds... ({retry_count} retries left)')
+                            time.sleep(DEFAULT_LB_RETRY_DELAY)
                         else:
-                            self.report_error('LOAD BALANCER', name, str(e))
+                            self.report_error('LOAD BALANCER', name, f'Conflict after retries: {str(e)}')
                             break
+                    except Exception as e:
+                        self.report_error('LOAD BALANCER', name, str(e))
+                        break
         except KeyError:
             pass
 
@@ -995,11 +984,10 @@ class DnsCleaner(AbstractCleaner):
                     else:
                         self.conn.dns.delete_zone(zone_id)
                         self.report_deletion('DNS ZONE', zone_name)
+                except os_exceptions.ResourceNotFound:
+                    self.report_not_found('DNS ZONE', zone_name)
                 except Exception as e:
-                    if "NotFound" in str(e):
-                        self.report_not_found('DNS ZONE', zone_name)
-                    else:
-                        self.report_error('DNS ZONE', zone_name, str(e))
+                    self.report_error('DNS ZONE', zone_name, str(e))
         except Exception as e:
             print(f'    . Could not clean DNS zones: {str(e)}')
 
@@ -1038,11 +1026,10 @@ class HeatCleaner(AbstractCleaner):
                         self.conn.orchestration.delete_stack(stack)
                         self.conn.orchestration.wait_for_delete(stack)
                         self.report_deletion('HEAT STACK', stack_name)
+                except os_exceptions.ResourceNotFound:
+                    self.report_not_found('HEAT STACK', stack_name)
                 except Exception as e:
-                    if "NotFound" in str(e):
-                        self.report_not_found('HEAT STACK', stack_name)
-                    else:
-                        self.report_error('HEAT STACK', stack_name, str(e))
+                    self.report_error('HEAT STACK', stack_name, str(e))
         except Exception as e:
             print(f'    . Could not clean Heat stacks: {str(e)}')
 
