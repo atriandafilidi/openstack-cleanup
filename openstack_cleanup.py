@@ -6,8 +6,7 @@
 #                                                                             #
 # This is a comprehensive cleanup script for OpenStack resources. It can      #
 # delete compute instances, networks, volumes, load balancers, Heat stacks,   #
-# Identity application credentials, and other resources matching a specified  #
-# filter pattern.                                                             #
+# and other resources matching a specified filter pattern.                    #                                         #
 #                                                                             #
 # Usage examples:                                                             #
 #     $ python3 openstack_cleanup.py --filter ".*test-cluster.*" --dryrun     #
@@ -195,9 +194,6 @@ class ResourceMonitor:
                     self.conn.network.get_security_group(resource_id)
                 elif resource_type.upper() == 'LOAD BALANCER':
                     self.conn.load_balancer.get_load_balancer(resource_id)
-                elif resource_type.upper() == 'IMAGE':
-                    self.conn.image.get_image(resource_id)
-                        
                 # Still here? Resource exists, keep waiting
                 print('.', end='', flush=True)
                 
@@ -435,17 +431,10 @@ class ComputeCleaner(AbstractCleaner):
         def keypairs_fetcher():
             return list(self.conn.compute.keypairs())
             
-        def images_fetcher():
-            try:
-                return list(self.conn.image.images())
-            except Exception:
-                return []
-
         res_desc = {
             'instances': [instances_fetcher],
             'flavors': [flavors_fetcher],
-            'keypairs': [keypairs_fetcher],
-            'images': [images_fetcher]
+            'keypairs': [keypairs_fetcher]
         }
         
         super(ComputeCleaner, self).__init__('Compute', res_desc, resources, dryrun)
@@ -484,7 +473,6 @@ class ComputeCleaner(AbstractCleaner):
         # Clean other compute resources
         self._clean_flavors()
         self._clean_keypairs()
-        self._clean_images()
 
     def _get_instance_floating_ips(self, instance):
         """Extract floating IP addresses from instance."""
@@ -562,20 +550,6 @@ class ComputeCleaner(AbstractCleaner):
                 self.report_not_found('KEYPAIR', keypair_name)
             except Exception as e:
                 self.report_error('KEYPAIR', keypair_name, str(e))
-
-    def _clean_images(self):
-        """Clean up images."""
-        for image_id, image_name in self.resources['images'].items():
-            try:
-                if self.dryrun:
-                    self.report_deletion('IMAGE', image_name)
-                else:
-                    self.conn.image.delete_image(image_id)
-                    self.report_deletion('IMAGE', image_name)
-            except os_exceptions.ResourceNotFound:
-                self.report_not_found('IMAGE', image_name)
-            except Exception as e:
-                self.report_error('IMAGE', image_name, str(e))
 
 class NetworkCleaner(AbstractCleaner):
 
@@ -1034,83 +1008,14 @@ class HeatCleaner(AbstractCleaner):
             print(f'    . Could not clean Heat stacks: {str(e)}')
 
 
-def _get_current_user_id(session):
-    """Current user ID from session auth (same as 'openstack application credential list')."""
-    try:
-        if getattr(session, 'auth', None) and hasattr(session.auth, 'get_user_id'):
-            return session.auth.get_user_id(session)
-    except Exception:
-        pass
-    return None
-
-
-def _get_in_use_app_cred_id(conn):
-    """ID of the application credential used for this session, or empty string."""
-    ac_id = (os.environ.get('OS_APPLICATION_CREDENTIAL_ID') or '').strip()
-    if not ac_id and getattr(conn, 'auth', None):
-        auth_ref = getattr(conn.auth, 'auth_ref', None)
-        ac_id = (getattr(auth_ref, 'application_credential_id', None) or '').strip()
-    return ac_id
-
-
-class IdentityCleaner(AbstractCleaner):
-    """
-    Cleaner for Identity (Keystone) application credentials for the current user.
-    Skips the credential used for this session to avoid locking out.
-    """
-
-    def __init__(self, sess, resources, dryrun):
-        self.conn = openstack.connection.Connection(session=sess)
-        self._user_id = _get_current_user_id(sess)
-        self._in_use_cred_id = _get_in_use_app_cred_id(self.conn)
-
-        res_desc = {}
-        if self._user_id:
-            conn, uid = self.conn, self._user_id
-            res_desc['application_credentials'] = [
-                lambda c=conn, u=uid: list(c.identity.application_credentials(u))
-            ]
-        else:
-            print('    . Identity: skipped (could not get current user ID)')
-
-        super(IdentityCleaner, self).__init__('Identity', res_desc, resources, dryrun)
-
-    def clean(self):
-        if not self._user_id:
-            return
-        app_creds = self.resources.get('application_credentials', {})
-        if not app_creds:
-            return
-
-        print('*** IDENTITY (application credentials) cleanup')
-        for cred_id, cred_name in app_creds.items():
-            if cred_id == self._in_use_cred_id:
-                print(f'    ⏭️  APPLICATION CREDENTIAL {cred_name} skipped (in use for this session)')
-                continue
-            try:
-                if self.dryrun:
-                    self.conn.identity.get_application_credential(self._user_id, cred_id)
-                    self.report_deletion('APPLICATION CREDENTIAL', cred_name)
-                else:
-                    self.conn.identity.delete_application_credential(
-                        self._user_id, cred_id, ignore_missing=True
-                    )
-                    self.report_deletion('APPLICATION CREDENTIAL', cred_name)
-            except os_exceptions.ResourceNotFound:
-                self.report_not_found('APPLICATION CREDENTIAL', cred_name)
-            except Exception as e:
-                self.report_error('APPLICATION CREDENTIAL', cred_name, str(e))
-
-
 # Type names (for --types) and their cleaner classes, in cleanup order
 CLEANER_TYPES = [
     ('heat', HeatCleaner),                  # orchestration stacks
     ('dns', DnsCleaner),                    # Designate DNS zones
-    ('compute', ComputeCleaner),            # instances, flavors, keypairs, images
+    ('compute', ComputeCleaner),            # instances, flavors, keypairs
     ('storage', StorageCleaner),            # volumes, volume_snapshots
     ('loadbalancer', LoadBalancerCleaner),
     ('network', NetworkCleaner),            # floating_ips, sec_groups, networks, routers
-    ('identity', IdentityCleaner),          # application_credentials
 ]
 
 
@@ -1154,7 +1059,7 @@ class OpenStackCleaners():
             cleaner.clean()
 
 # Here's how we store what needs to be cleaned up:
-# First level keys are service types: flavors, keypairs, application_credentials,
+# First level keys are service types: flavors, keypairs,
 # users, routers, floating_ips, instances, volumes, etc.
 # Second level keys are the actual resource IDs  
 # Values are the human-readable names (e.g. 'TEST-instance-1', 'DEV-network-2')
@@ -1213,7 +1118,7 @@ def main():
     parser.add_argument('-t', '--types', dest='types',
                         action='store', default=None, metavar='types',
                         help='limit cleanup to these types only (default: all). '
-                             'Types: heat, dns, compute, storage, loadbalancer, network, identity. '
+                             'Types: heat, dns, compute, storage, loadbalancer, network. '
                              'E.g. -t compute,network')
     opts = parser.parse_args()
 
@@ -1227,7 +1132,7 @@ def main():
     resource_types = None
     if opts.types:
         resource_types = [s.strip().lower() for s in opts.types.split(',') if s.strip()]
-        allowed = {'heat', 'dns', 'compute', 'storage', 'loadbalancer', 'network', 'identity'}
+        allowed = {'heat', 'dns', 'compute', 'storage', 'loadbalancer', 'network'}
         invalid = [t for t in resource_types if t not in allowed]
         if invalid:
             print(f"❌ ERROR: Invalid type(s): {invalid}")
