@@ -1088,6 +1088,28 @@ def get_resources_from_cleanup_log(logfile):
     return resources
 
 
+def _is_wildcard_filter(pattern):
+    """Return True if the pattern is too broad for safe discovery (likely to match all resources).
+
+    Catches regexes that match the empty string (e.g. ``.*``, ``^$``) and those that full-match
+    every member of a small set of diverse sample names (e.g. ``.+``, ``^.+$``), which would
+    also select essentially everything in the project.
+    """
+    try:
+        r = re.compile(pattern)
+    except re.error:
+        return False
+    if r.fullmatch('') is not None:
+        return True
+    samples = (
+        'a',
+        '0',
+        'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx',
+        'very-long-openstack-resource-name-segment-0123456789',
+    )
+    return all(r.fullmatch(s) is not None for s in samples)
+
+
 def main():
     parser = argparse.ArgumentParser(description='OpenStack Resource Cleanup Tool')
 
@@ -1209,15 +1231,20 @@ def main():
         # No file means we'll discover resources by scanning OpenStack and matching names
         resources = None
     global resource_name_re
-    if opts.filter:
-        try:
-            resource_name_re = re.compile(opts.filter)
-        except Exception as exc:
-            print('Provided filter is not a valid python regular expression: ' + opts.filter)
-            print(str(exc))
-            return 1
-    else:
-        resource_name_re = re.compile('.*test-cluster.*')
+    filter_pattern = opts.filter if opts.filter else '.*test-cluster.*'
+
+    if _is_wildcard_filter(filter_pattern):
+        print(f"❌ ERROR: Filter '{filter_pattern}' is too broad (would match almost any resource).")
+        print("   Use a more specific pattern, e.g. '.*my-cluster.*'")
+        return 1
+
+    try:
+        resource_name_re = re.compile(filter_pattern)
+    except re.error as exc:
+        print(f"❌ ERROR: Filter '{filter_pattern}' is not a valid regular expression.")
+        print(f"   {exc}")
+        print("   Use Python regex syntax, e.g. '.*my-cluster.*' (not shell globs: * alone is invalid).")
+        return 1
 
 
     cleaners = OpenStackCleaners(cred, resources, opts.dryrun, resource_types=resource_types)
