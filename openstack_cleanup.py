@@ -212,8 +212,6 @@ class ResourceMonitor:
                 # Try to get the resource - if it exists, it's not deleted yet
                 if resource_type.upper() in ['INSTANCE', 'SERVER']:
                     self.conn.compute.get_server(resource_id)
-                elif resource_type.upper() == 'FLAVOR':
-                    self.conn.compute.get_flavor(resource_id)
                 elif resource_type.upper() == 'VOLUME':
                     self.conn.block_storage.get_volume(resource_id)
                 elif resource_type.upper() == 'SNAPSHOT':
@@ -441,16 +439,12 @@ class ComputeCleaner(AbstractCleaner):
         
         def instances_fetcher():
             return list(self.conn.compute.servers())
-            
-        def flavors_fetcher():
-            return list(self.conn.compute.flavors())
-            
+
         def keypairs_fetcher():
             return list(self.conn.compute.keypairs())
-            
+
         res_desc = {
             'instances': [instances_fetcher],
-            'flavors': [flavors_fetcher],
             'keypairs': [keypairs_fetcher]
         }
         
@@ -490,7 +484,6 @@ class ComputeCleaner(AbstractCleaner):
         if not self.dryrun and deleting_instances:
             self._wait_for_instance_deletion(deleting_instances)
 
-        self._clean_flavors()
         self._clean_keypairs()
 
     def _wait_for_instance_deletion(self, deleting_instances):
@@ -514,20 +507,6 @@ class ComputeCleaner(AbstractCleaner):
         
         if deleting_instances:
             print(f'    . Warning: {len(deleting_instances)} instances may still be deleting')
-
-    def _clean_flavors(self):
-        """Clean up flavors."""
-        for flavor_id, flavor_name in self.resources['flavors'].items():
-            try:
-                if self.dryrun:
-                    self.report_deletion('FLAVOR', flavor_name)
-                else:
-                    self.conn.compute.delete_flavor(flavor_id)
-                    self.report_deletion('FLAVOR', flavor_name)
-            except os_exceptions.ResourceNotFound:
-                self.report_not_found('FLAVOR', flavor_name)
-            except Exception as e:
-                self.report_error('FLAVOR', flavor_name, str(e))
 
     def _clean_keypairs(self):
         """Clean up keypairs."""
@@ -1006,7 +985,7 @@ def collect_preview_floating_ip_rows(conn, cleaners):
 CLEANER_TYPES = [
     ('heat', HeatCleaner),                  # orchestration stacks
     ('dns', DnsCleaner),                    # Designate DNS zones
-    ('compute', ComputeCleaner),            # instances, flavors, keypairs
+    ('compute', ComputeCleaner),            # instances, keypairs
     ('storage', StorageCleaner),            # volumes, volume_snapshots
     ('loadbalancer', LoadBalancerCleaner),
     ('network', NetworkCleaner),            # ports, sec_groups, networks, routers
@@ -1061,8 +1040,8 @@ class OpenStackCleaners():
             cleaner.clean()
 
 # Here's how we store what needs to be cleaned up:
-# First level keys are service types: flavors, keypairs,
-# users, routers, instances, volumes, floating_ips (preview), etc.
+# First level keys are service types: keypairs, users, routers, instances,
+# volumes, floating_ips (preview), etc.
 # Second level keys are the actual resource IDs  
 # Values are the human-readable names (e.g. 'TEST-instance-1', 'DEV-network-2')
 def get_resources_from_cleanup_log(logfile):
