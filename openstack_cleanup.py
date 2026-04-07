@@ -52,12 +52,46 @@ except ImportError:
     exit(1)
 
 # Constants to avoid magic numbers scattered throughout the code
-DEFAULT_DESCRIPTION_TRUNCATE_LENGTH = 30
 DEFAULT_RETRY_COUNT = 3
 DEFAULT_VOLUME_DETACH_EXTRA_RETRIES = 5
 DEFAULT_LB_RETRY_DELAY = 10
 DEFAULT_ROUTER_FIP_WAIT = 5
 DEFAULT_INSTANCE_DELETE_RETRIES = 30
+
+
+def release_floating_ips_on_port(conn, port_id, dryrun, claimed_fip_ids,
+                                   report_deletion, report_not_found, report_error):
+    """Delete Neutron floating IPs associated with ``port_id`` (``floatingip.port_id``)."""
+    if not port_id:
+        return
+    try:
+        attached = [
+            fip for fip in conn.network.ips()
+            if getattr(fip, 'port_id', None) == port_id
+        ]
+    except Exception as e:
+        print(f'    . Could not list floating IPs for port {port_id}: {e}')
+        return
+    for fip in attached:
+        fid = fip.id
+        if claimed_fip_ids is not None and fid in claimed_fip_ids:
+            continue
+        addr = fip.floating_ip_address
+        if dryrun:
+            if claimed_fip_ids is not None:
+                claimed_fip_ids.add(fid)
+            report_deletion('FLOATING IP', addr)
+        else:
+            try:
+                conn.network.delete_ip(fid)
+                if claimed_fip_ids is not None:
+                    claimed_fip_ids.add(fid)
+                report_deletion('FLOATING IP', addr)
+            except os_exceptions.ResourceNotFound:
+                report_not_found('FLOATING IP', addr)
+            except Exception as e:
+                report_error('FLOATING IP', addr, str(e))
+
 
 # ============================================================================ #
 # Credentials - handling OpenStack authentication the easy way                 #
@@ -301,30 +335,13 @@ def build_resource_dict(res_list):
             resid = res.id
             resname = getattr(res, 'name', resid)
             resdesc = getattr(res, 'description', '')
-            
-            # Special handling for floating IPs since they're a bit different
-            if hasattr(res, 'floating_ip_address'):
-                resname = res.floating_ip_address
-                if resdesc:
-                    truncated_desc = resdesc[:50] + "..." if len(resdesc) > 50 else resdesc
-                    resname += f" (desc: {truncated_desc})"
-                    
         except AttributeError:
-            # Handle dict-style resources
             resid = res.get('id', res)
             resname = res.get('name', resid)
             resdesc = res.get('description', '')
-            
-            # Floating IPs in dict format
-            if 'floating_ip_address' in res:
-                resname = res['floating_ip_address']
-                if resdesc:
-                    truncated_desc = resdesc[:50] + "..." if len(resdesc) > 50 else resdesc
-                    resname += f" (desc: {truncated_desc})"
-        
-        # Include resource if name or description matches our pattern
-        if resname and (resource_name_re.search(resname) or 
-                       (resdesc and resource_name_re.search(resdesc))):
+
+        if resname and (resource_name_re.search(str(resname)) or
+                       (resdesc and resource_name_re.search(str(resdesc)))):
             resources[resid] = resname
     return resources
 
@@ -438,68 +455,43 @@ class ComputeCleaner(AbstractCleaner):
         }
         
         super(ComputeCleaner, self).__init__('Compute', res_desc, resources, dryrun)
+        self.claimed_fip_ids = None
+
+    def set_claimed_floating_ips(self, id_set):
+        self.claimed_fip_ids = id_set
+
+    def _release_floating_ips_for_instance(self, instance_id):
+        try:
+            for port in self.conn.network.ports(device_id=instance_id):
+                release_floating_ips_on_port(
+                    self.conn, port.id, self.dryrun, self.claimed_fip_ids,
+                    self.report_deletion, self.report_not_found, self.report_error)
+        except Exception as e:
+            print(f'    . Could not list Neutron ports for instance {instance_id}: {e}')
 
     def clean(self):
         print('*** COMPUTE cleanup')
-        
-        # Clean instances with their floating IPs
+
         deleting_instances = dict(self.resources['instances'])
         for ins_id, ins_name in self.resources['instances'].items():
             try:
-                # Get instance and its floating IPs
-                instance = self.conn.compute.get_server(ins_id)
-                fips = self._get_instance_floating_ips(instance) if instance else []
-                
+                self.conn.compute.get_server(ins_id)
+                self._release_floating_ips_for_instance(ins_id)
                 if self.dryrun:
-                    for fip in fips:
-                        self.report_deletion('FLOATING IP', fip)
                     self.report_deletion('INSTANCE', ins_name)
                 else:
-                    # Delete floating IPs first
-                    self._delete_floating_ips(fips)
-                    # Delete instance
                     self.conn.compute.delete_server(ins_id)
-                    
             except os_exceptions.ResourceNotFound:
                 deleting_instances.pop(ins_id, None)
                 self.report_not_found('INSTANCE', ins_name)
             except Exception as e:
                 self.report_error('INSTANCE', ins_name, str(e))
 
-        # Wait for instance deletion to complete
         if not self.dryrun and deleting_instances:
             self._wait_for_instance_deletion(deleting_instances)
 
-        # Clean other compute resources
         self._clean_flavors()
         self._clean_keypairs()
-
-    def _get_instance_floating_ips(self, instance):
-        """Extract floating IP addresses from instance."""
-        if not instance.addresses:
-            return []
-        
-        fips = []
-        for addresses in instance.addresses.values():
-            fips.extend([addr['addr'] for addr in addresses 
-                        if addr.get('OS-EXT-IPS:type') == 'floating'])
-        return fips
-
-    def _delete_floating_ips(self, fip_addresses):
-        """Delete floating IPs by their addresses."""
-        if not fip_addresses:
-            return
-            
-        fip_lst = list(self.conn.network.ips())
-        for fip_addr in fip_addresses:
-            for fip_obj in fip_lst:
-                if fip_obj.floating_ip_address == fip_addr:
-                    try:
-                        self.conn.network.delete_ip(fip_obj.id)
-                        self.report_deletion('FLOATING IP', fip_addr)
-                    except Exception as e:
-                        self.report_error('FLOATING IP', fip_addr, str(e))
-                    break
 
     def _wait_for_instance_deletion(self, deleting_instances):
         """Wait for instances to finish deleting - sometimes they take a while."""
@@ -564,17 +556,22 @@ class NetworkCleaner(AbstractCleaner):
 
         def secgroup_fetcher():
             return list(self.conn.network.security_groups())
-            
-        def floating_ips_fetcher():
-            return list(self.conn.network.ips())
 
         res_desc = {
-            'floating_ips': [floating_ips_fetcher],
             'sec_groups': [secgroup_fetcher],
             'networks': [networks_fetcher],
             'routers': [routers_fetcher]
         }
         super(NetworkCleaner, self).__init__('Network', res_desc, resources, dryrun)
+        self.claimed_fip_ids = None
+
+    def set_claimed_floating_ips(self, id_set):
+        self.claimed_fip_ids = id_set
+
+    def _release_fips_on_port(self, port_id):
+        release_floating_ips_on_port(
+            self.conn, port_id, self.dryrun, self.claimed_fip_ids,
+            self.report_deletion, self.report_not_found, self.report_error)
 
     def remove_router_interface(self, router_id, port):
         """Clean up router interface the hard way."""
@@ -585,25 +582,6 @@ class NetworkCleaner(AbstractCleaner):
             self.report_deletion('Router Interface', ip_address)
         except Exception:
             pass
-
-    def _delete_floating_ip(self, fip, reason=""):
-        """Delete a floating IP and report what happened."""
-        fip_id = fip.id
-        fip_ip = fip.floating_ip_address
-        fip_description = getattr(fip, 'description', '') or ''
-        
-        try:
-            if self.dryrun:
-                description_info = f" (desc: {fip_description[:DEFAULT_DESCRIPTION_TRUNCATE_LENGTH]}...)" if fip_description else ""
-                self.report_deletion('FLOATING IP', f"{fip_ip}{description_info}")
-            else:
-                self.conn.network.delete_ip(fip_id)
-                description_info = f" (desc: {fip_description[:DEFAULT_DESCRIPTION_TRUNCATE_LENGTH]}...)" if fip_description else ""
-                self.report_deletion('FLOATING IP', f"{fip_ip}{description_info}")
-        except os_exceptions.ResourceNotFound:
-            self.report_not_found('FLOATING IP', fip_ip)
-        except Exception as e:
-            self.report_error('FLOATING IP', fip_ip, str(e))
 
     def clean(self):
         print('*** NETWORK cleanup')
@@ -618,41 +596,7 @@ class NetworkCleaner(AbstractCleaner):
         except KeyError:
             pass
 
-        # 1. First clean up discovered floating IPs (the ones we found during discovery)
-        try:
-            for id, name in self.resources.get('floating_ips', {}).items():
-                try:
-                    fip = self.conn.network.get_ip(id)
-                    self._delete_floating_ip(fip)
-                except os_exceptions.ResourceNotFound:
-                    self.report_not_found('FLOATING IP', name)
-                except Exception as e:
-                    self.report_error('FLOATING IP', name, str(e))
-        except KeyError:
-            pass
-
-        # 2. Extra sweep for any floating IPs we might have missed
-        try:
-            all_floating_ips = list(self.conn.network.ips())
-                
-            for fip in all_floating_ips:
-                fip_id = fip.id
-                fip_ip = fip.floating_ip_address
-                fip_description = getattr(fip, 'description', '') or ''
-                
-                # Skip ones we already processed
-                if fip_id in self.resources.get('floating_ips', {}):
-                    continue
-                
-                # See if this one matches our pattern
-                if (resource_name_re.search(str(fip_ip)) or 
-                    resource_name_re.search(str(fip_id)) or
-                    resource_name_re.search(str(fip_description))):
-                    self._delete_floating_ip(fip)
-        except Exception as e:
-            print(f'    . Could not list additional floating IPs: {str(e)}')
-
-        # 3. Look for ports that match our pattern and clean them up too
+        # Ports matching the filter: release any floating IPs on those ports, then delete the port
         try:
             all_ports = list(self.conn.network.ports())
                 
@@ -667,6 +611,7 @@ class NetworkCleaner(AbstractCleaner):
                         
                         # Skip system ports (they get handled by their parent resources)
                         if device_owner not in ['network:router_interface', 'network:dhcp', 'network:router_gateway']:
+                            self._release_fips_on_port(port_id)
                             if self.dryrun:
                                 self.report_deletion('PORT', port_name)
                             else:
@@ -686,50 +631,22 @@ class NetworkCleaner(AbstractCleaner):
                 try:
                     if self.dryrun:
                         self.conn.network.get_router(id)
-                        self.report_deletion('Router Gateway', name)
-                        
                         port_list = list(self.conn.network.ports(device_id=id))
-                            
+                        for port in port_list:
+                            self._release_fips_on_port(port.id)
+                        self.report_deletion('Router Gateway', name)
                         for port in port_list:
                             if port.fixed_ips:
                                 self.report_deletion('Router Interface', port.fixed_ips[0]['ip_address'])
                     else:
                         router = self.conn.network.get_router(id)
-                        
-                        # First thing - find any floating IPs hanging around this router
-                        print(f'    . Checking for floating IPs on router {name}...')
-                        try:
-                            all_floating_ips = list(self.conn.network.ips())
-                            router_fips = []
-                            for fip in all_floating_ips:
-                                if (hasattr(fip, 'router_id') and fip.router_id == id) or \
-                                   (hasattr(fip, 'port_id') and fip.port_id):
-                                    # Is this floating IP on a port that belongs to our router?
-                                    try:
-                                        port = self.conn.network.get_port(fip.port_id)
-                                        if port.device_id == id:
-                                            router_fips.append(fip)
-                                    except:
-                                        pass
-                            
-                            # Get rid of those floating IPs first
-                            for fip in router_fips:
-                                try:
-                                    print(f'    . Deleting floating IP {fip.floating_ip_address} attached to router...')
-                                    self.conn.network.delete_ip(fip.id)
-                                    self.report_deletion('FLOATING IP', fip.floating_ip_address)
-                                except Exception as e:
-                                    print(f'    . Could not delete floating IP {fip.floating_ip_address}: {str(e)}')
-                                    
-                        except Exception as e:
-                            print(f'    . Could not list floating IPs: {str(e)}')
-                        
-                        # Give floating IPs a moment to fully disappear (ours or any we deleted earlier)
-                        if router_fips:
+                        print(f'    . Releasing floating IPs on ports for router {name}...')
+                        port_list = list(self.conn.network.ports(device_id=id))
+                        for port in port_list:
+                            self._release_fips_on_port(port.id)
+
+                        if port_list or router.external_gateway_info:
                             print('    . Waiting for floating IPs to be fully released...')
-                            time.sleep(DEFAULT_ROUTER_FIP_WAIT)
-                        elif router.external_gateway_info:
-                            # FIPs may have been deleted in the floating_ips step; wait for Neutron to see it
                             time.sleep(DEFAULT_ROUTER_FIP_WAIT)
                         
                         # Now remove the gateway (should work better without floating IPs)
@@ -792,8 +709,8 @@ class NetworkCleaner(AbstractCleaner):
                                         if (port.device_owner or '').startswith('network:router') or \
                                            (port.device_owner or '').startswith('network:ha_router'):
                                             continue
-                                        # Try to clean up the stragglers
                                         try:
+                                            self._release_fips_on_port(port.id)
                                             print(f'    . Deleting remaining port {port.name or port.id}...')
                                             self.conn.network.delete_port(port.id)
                                         except Exception as e:
@@ -870,10 +787,14 @@ class LoadBalancerCleaner(AbstractCleaner):
             'loadbalancers': [loadbalancers_fetcher]
         }
         super(LoadBalancerCleaner, self).__init__('LoadBalancer', res_desc, resources, dryrun)
-    
+        self.claimed_fip_ids = None
+
     def set_monitor(self, monitor):
         """Hook up the progress monitor so we can track what's happening"""
         self.monitor = monitor
+
+    def set_claimed_floating_ips(self, id_set):
+        self.claimed_fip_ids = id_set
 
     def clean(self):
         print('*** LOAD BALANCER cleanup')
@@ -888,10 +809,18 @@ class LoadBalancerCleaner(AbstractCleaner):
                 while retry_count > 0:
                     try:
                         if self.dryrun:
+                            try:
+                                lb = self.conn.load_balancer.get_load_balancer(id)
+                                release_floating_ips_on_port(
+                                    self.conn, lb.vip_port_id, True, self.claimed_fip_ids,
+                                    self.report_deletion, self.report_not_found, self.report_error)
+                            except os_exceptions.ResourceNotFound:
+                                pass
+                            except Exception as e:
+                                print(f'    . Could not inspect load balancer {name} for VIP floating IPs (dryrun): {e}')
                             self.report_deletion('LOAD BALANCER', name)
                             break
                         else:
-                            # Check what state this load balancer is in
                             try:
                                 lb = self.conn.load_balancer.get_load_balancer(id)
                                 if lb.provisioning_status in ['PENDING_UPDATE', 'PENDING_CREATE', 'PENDING_DELETE']:
@@ -903,11 +832,13 @@ class LoadBalancerCleaner(AbstractCleaner):
                                     else:
                                         self.report_error('LOAD BALANCER', name, f'Still in {lb.provisioning_status} state after retries')
                                         break
+                                release_floating_ips_on_port(
+                                    self.conn, lb.vip_port_id, False, self.claimed_fip_ids,
+                                    self.report_deletion, self.report_not_found, self.report_error)
                             except os_exceptions.ResourceNotFound:
                                 self.report_not_found('LOAD BALANCER', name)
                                 break
-                            
-                            # Try cascade delete (should handle dependencies automatically)
+
                             self.conn.load_balancer.delete_load_balancer(id, cascade=True)
                             self.report_deletion('LOAD BALANCER', name)
                             
@@ -1008,6 +939,69 @@ class HeatCleaner(AbstractCleaner):
             print(f'    . Could not clean Heat stacks: {str(e)}')
 
 
+def collect_preview_floating_ip_rows(conn, cleaners):
+    """FIPs that cleanup will remove (same attachment rules as release), for the summary table."""
+    try:
+        fips_by_port = {}
+        for fip in conn.network.ips():
+            pid = getattr(fip, 'port_id', None)
+            if pid:
+                fips_by_port.setdefault(pid, []).append(fip)
+    except Exception:
+        return []
+
+    seen = set()
+    rows = []
+
+    def add_port_fips(port_id):
+        if not port_id:
+            return
+        for fip in fips_by_port.get(port_id, ()):
+            if fip.id in seen:
+                continue
+            seen.add(fip.id)
+            rows.append(['floating_ips', fip.floating_ip_address, fip.id])
+
+    skip_port_owners = frozenset([
+        'network:router_interface', 'network:dhcp', 'network:router_gateway'])
+
+    for c in cleaners:
+        if isinstance(c, ComputeCleaner):
+            for ins_id in c.resources.get('instances', {}):
+                try:
+                    for port in conn.network.ports(device_id=ins_id):
+                        add_port_fips(port.id)
+                except Exception:
+                    pass
+        elif isinstance(c, LoadBalancerCleaner):
+            for lb_id in c.resources.get('loadbalancers', {}):
+                try:
+                    lb = conn.load_balancer.get_load_balancer(lb_id)
+                    add_port_fips(lb.vip_port_id)
+                except Exception:
+                    pass
+        elif isinstance(c, NetworkCleaner):
+            try:
+                for port in conn.network.ports():
+                    port_name = port.name
+                    if not (resource_name_re.search(str(port_name)) or
+                            resource_name_re.search(str(port.id))):
+                        continue
+                    if (port.device_owner or '') in skip_port_owners:
+                        continue
+                    add_port_fips(port.id)
+            except Exception:
+                pass
+            for rid in c.resources.get('routers', {}):
+                try:
+                    for port in conn.network.ports(device_id=rid):
+                        add_port_fips(port.id)
+                except Exception:
+                    pass
+    rows.sort(key=lambda r: (r[1] or ''))
+    return rows
+
+
 # Type names (for --types) and their cleaner classes, in cleanup order
 CLEANER_TYPES = [
     ('heat', HeatCleaner),                  # orchestration stacks
@@ -1015,7 +1009,7 @@ CLEANER_TYPES = [
     ('compute', ComputeCleaner),            # instances, flavors, keypairs
     ('storage', StorageCleaner),            # volumes, volume_snapshots
     ('loadbalancer', LoadBalancerCleaner),
-    ('network', NetworkCleaner),            # floating_ips, sec_groups, networks, routers
+    ('network', NetworkCleaner),            # ports, sec_groups, networks, routers
 ]
 
 
@@ -1029,7 +1023,9 @@ class OpenStackCleaners():
         self.cleaners = []
         self.dryrun = dryrun
         sess = creds_obj.get_session()
+        self._session = sess
         self.monitor = ResourceMonitor(sess, dryrun)
+        claimed_floating_ip_ids = set()
 
         types_set = set(resource_types) if resource_types else None
         for type_name, cleaner_class in CLEANER_TYPES:
@@ -1038,12 +1034,18 @@ class OpenStackCleaners():
             cleaner = cleaner_class(sess, resources, dryrun)
             if hasattr(cleaner, 'set_monitor'):
                 cleaner.set_monitor(self.monitor)
+            if hasattr(cleaner, 'set_claimed_floating_ips'):
+                cleaner.set_claimed_floating_ips(claimed_floating_ip_ids)
             self.cleaners.append(cleaner)
 
     def show_resources(self):
+        conn = openstack.connection.Connection(session=self._session)
+        fip_rows = collect_preview_floating_ip_rows(conn, self.cleaners)
         table = [["Resource type", "Name", "UUID"]]
         for cleaner in self.cleaners:
             table.extend(cleaner.get_resource_list())
+        if fip_rows:
+            table.extend(fip_rows)
         count = len(table) - 1
         print()
         if count:
@@ -1060,7 +1062,7 @@ class OpenStackCleaners():
 
 # Here's how we store what needs to be cleaned up:
 # First level keys are service types: flavors, keypairs,
-# users, routers, floating_ips, instances, volumes, etc.
+# users, routers, instances, volumes, floating_ips (preview), etc.
 # Second level keys are the actual resource IDs  
 # Values are the human-readable names (e.g. 'TEST-instance-1', 'DEV-network-2')
 def get_resources_from_cleanup_log(logfile):
