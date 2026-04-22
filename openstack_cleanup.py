@@ -33,10 +33,12 @@
 # ====================================================== #
 
 from abc import ABCMeta, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import argparse
 import os
 import re
 import sys
+import threading
 import time
 
 from tabulate import tabulate
@@ -57,35 +59,164 @@ DEFAULT_VOLUME_DETACH_EXTRA_RETRIES = 5
 DEFAULT_LB_RETRY_DELAY = 10
 DEFAULT_ROUTER_FIP_WAIT = 5
 DEFAULT_INSTANCE_DELETE_RETRIES = 30
+DEFAULT_PARALLELISM = 10
+
+
+# Single lock for all stdout writes so parallel workers don't interleave log lines.
+_PRINT_LOCK = threading.Lock()
+
+
+def log(msg):
+    """Thread-safe print; use this from any code that may run under the thread pool."""
+    with _PRINT_LOCK:
+        print(msg)
+
+
+def run_in_parallel(items, worker_fn, max_workers):
+    """Run ``worker_fn(item)`` for each entry in ``items``.
+
+    - ``max_workers <= 1`` (or a single item) falls back to a plain loop, so callers
+      can always use this helper without special-casing the serial path.
+    - Exceptions raised by workers are logged but do not abort the batch; individual
+      resources already report their own errors via ``report_error``.
+    """
+    items = list(items)
+    if not items:
+        return
+    if max_workers <= 1 or len(items) == 1:
+        for item in items:
+            try:
+                worker_fn(item)
+            except Exception as e:
+                log(f'    . Worker error: {e}')
+        return
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = [ex.submit(worker_fn, item) for item in items]
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log(f'    . Worker error: {e}')
+
+
+class ClaimedFloatingIPSet:
+    """Thread-safe set of already-handled floating-IP ids.
+
+    ``claim(fid)`` atomically checks membership and, if absent, inserts and returns
+    True. This replaces the earlier ``if fid in s: ... s.add(fid)`` pattern which was
+    racy when called from multiple workers.
+    """
+
+    def __init__(self):
+        self._ids = set()
+        self._lock = threading.Lock()
+
+    def __contains__(self, fid):
+        with self._lock:
+            return fid in self._ids
+
+    def claim(self, fid):
+        with self._lock:
+            if fid in self._ids:
+                return False
+            self._ids.add(fid)
+            return True
+
+    def add(self, fid):
+        with self._lock:
+            self._ids.add(fid)
+
+
+class FloatingIPIndex:
+    """Lazy, shared port_id -> [FloatingIP] index.
+
+    A single list() call is reused across cleaners to avoid an O(ports * fips)
+    listing cost. Listing failures are not cached so transient errors don't
+    permanently disable FIP release; retries are capped by _MAX_FAILED_ATTEMPTS.
+    """
+
+    _MAX_FAILED_ATTEMPTS = 3
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._by_port = None
+        self._failed_attempts = 0
+        self._lock = threading.Lock()
+
+    def _ensure_loaded(self):
+        if self._by_port is not None:
+            return self._by_port
+        with self._lock:
+            if self._by_port is not None:
+                return self._by_port
+            if self._failed_attempts >= self._MAX_FAILED_ATTEMPTS:
+                return {}
+            by_port = {}
+            try:
+                for fip in self._conn.network.ips():
+                    pid = getattr(fip, 'port_id', None)
+                    if pid:
+                        by_port.setdefault(pid, []).append(fip)
+            except Exception as e:
+                self._failed_attempts += 1
+                log(f'    . Could not list floating IPs '
+                    f'(attempt {self._failed_attempts}/{self._MAX_FAILED_ATTEMPTS}): {e}')
+                return {}
+            self._by_port = by_port
+            return by_port
+
+    def for_port(self, port_id):
+        if not port_id:
+            return []
+        return list(self._ensure_loaded().get(port_id, []))
+
+    def all_by_port(self):
+        return dict(self._ensure_loaded())
 
 
 def release_floating_ips_on_port(conn, port_id, dryrun, claimed_fip_ids,
-                                   report_deletion, report_not_found, report_error):
-    """Delete Neutron floating IPs associated with ``port_id`` (``floatingip.port_id``)."""
+                                   report_deletion, report_not_found, report_error,
+                                   fip_index=None):
+    """Delete Neutron floating IPs associated with ``port_id`` (``floatingip.port_id``).
+
+    When ``fip_index`` (a :class:`FloatingIPIndex`) is supplied, lookups avoid issuing
+    a fresh ``network.ips()`` listing for every call, which is the single biggest
+    win on large deployments. When ``claimed_fip_ids`` is a :class:`ClaimedFloatingIPSet`,
+    the claim is atomic so duplicate delete attempts don't race across threads.
+    """
     if not port_id:
         return
-    try:
-        attached = [
-            fip for fip in conn.network.ips()
-            if getattr(fip, 'port_id', None) == port_id
-        ]
-    except Exception as e:
-        print(f'    . Could not list floating IPs for port {port_id}: {e}')
-        return
+    if fip_index is not None:
+        attached = fip_index.for_port(port_id)
+    else:
+        try:
+            attached = [
+                fip for fip in conn.network.ips()
+                if getattr(fip, 'port_id', None) == port_id
+            ]
+        except Exception as e:
+            log(f'    . Could not list floating IPs for port {port_id}: {e}')
+            return
+
     for fip in attached:
         fid = fip.id
-        if claimed_fip_ids is not None and fid in claimed_fip_ids:
-            continue
+        if claimed_fip_ids is not None:
+            # Atomic check-and-claim: prevents two workers from both attempting the
+            # same delete_ip when the same FIP is reachable from, e.g., both an
+            # instance port and a router port.
+            if isinstance(claimed_fip_ids, ClaimedFloatingIPSet):
+                if not claimed_fip_ids.claim(fid):
+                    continue
+            else:
+                if fid in claimed_fip_ids:
+                    continue
+                claimed_fip_ids.add(fid)
         addr = fip.floating_ip_address
         if dryrun:
-            if claimed_fip_ids is not None:
-                claimed_fip_ids.add(fid)
             report_deletion('FLOATING IP', addr)
         else:
             try:
                 conn.network.delete_ip(fid)
-                if claimed_fip_ids is not None:
-                    claimed_fip_ids.add(fid)
                 report_deletion('FLOATING IP', addr)
             except os_exceptions.ResourceNotFound:
                 report_not_found('FLOATING IP', addr)
@@ -345,10 +476,12 @@ def build_resource_dict(res_list):
 
 class AbstractCleaner(metaclass=ABCMeta):
 
-    def __init__(self, res_category, res_desc, resources, dryrun):
+    def __init__(self, res_category, res_desc, resources, dryrun, parallelism=1):
         self.dryrun = dryrun
         self.category = res_category
+        self.parallelism = max(1, int(parallelism))
         self.resources = {}
+        self.fip_index = None  # Set via set_fip_index() before clean().
         if not resources:
             print(f'Discovering {res_category} resources...')
         for rtype, fetch_args in res_desc.items():
@@ -358,15 +491,19 @@ class AbstractCleaner(metaclass=ABCMeta):
                 res_list = fetch_resources(*fetch_args)
                 self.resources[rtype] = build_resource_dict(res_list)
 
+    def set_fip_index(self, fip_index):
+        """Inject the shared FloatingIPIndex so per-port FIP lookups are O(1)."""
+        self.fip_index = fip_index
+
     def report_deletion(self, rtype, name):
         status = "(but is not deleted: dry run)" if self.dryrun else "is successfully deleted"
-        print(f'    + {rtype} {name} {status}')
+        log(f'    + {rtype} {name} {status}')
 
     def report_not_found(self, rtype, name):
-        print(f'    ? {rtype} {name} not found (already deleted?)')
+        log(f'    ? {rtype} {name} not found (already deleted?)')
 
     def report_error(self, rtype, name, reason):
-        print(f'    - {rtype} {name} ERROR: {reason}')
+        log(f'    - {rtype} {name} ERROR: {reason}')
 
     def get_resource_list(self):
         result = []
@@ -380,7 +517,7 @@ class AbstractCleaner(metaclass=ABCMeta):
         pass
 
 class StorageCleaner(AbstractCleaner):
-    def __init__(self, sess, resources, dryrun):
+    def __init__(self, sess, resources, dryrun, parallelism=1):
         self.conn = openstack.connection.Connection(session=sess)
         
         def volumes_fetcher():
@@ -394,47 +531,49 @@ class StorageCleaner(AbstractCleaner):
             'volume_snapshots': [snapshots_fetcher]
         }
             
-        super(StorageCleaner, self).__init__('Storage', res_desc, resources, dryrun)
+        super(StorageCleaner, self).__init__('Storage', res_desc, resources, dryrun, parallelism)
+
+    def _delete_volume(self, item):
+        vid, name = item
+        try:
+            if self.dryrun:
+                self.conn.block_storage.get_volume(vid)
+            else:
+                self.conn.block_storage.delete_volume(vid)
+            self.report_deletion('VOLUME', name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('VOLUME', name)
+        except Exception as e:
+            self.report_error('VOLUME', name, str(e))
+
+    def _delete_snapshot(self, item):
+        sid, name = item
+        try:
+            if self.dryrun:
+                self.conn.block_storage.get_snapshot(sid)
+            else:
+                self.conn.block_storage.delete_snapshot(sid)
+            self.report_deletion('VOLUME SNAPSHOT', name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('VOLUME SNAPSHOT', name)
+        except Exception as e:
+            self.report_error('VOLUME SNAPSHOT', name, str(e))
 
     def clean(self):
         print('*** STORAGE cleanup')
-        
-        # Delete volumes (instances should be deleted first, so all volumes can be safely deleted)
-        try:
-            for id, name in self.resources['volumes'].items():
-                try:
-                    if self.dryrun:
-                        self.conn.block_storage.get_volume(id)
-                        self.report_deletion('VOLUME', name)
-                    else:
-                        self.conn.block_storage.delete_volume(id)
-                        self.report_deletion('VOLUME', name)
-                except os_exceptions.ResourceNotFound:
-                    self.report_not_found('VOLUME', name)
-                except Exception as e:
-                    self.report_error('VOLUME', name, str(e))
-        except KeyError:
-            pass
 
-        # Clean up volume snapshots
-        try:
-            for id, name in self.resources['volume_snapshots'].items():
-                try:
-                    if self.dryrun:
-                        self.conn.block_storage.get_snapshot(id)
-                        self.report_deletion('VOLUME SNAPSHOT', name)
-                    else:
-                        self.conn.block_storage.delete_snapshot(id)
-                        self.report_deletion('VOLUME SNAPSHOT', name)
-                except os_exceptions.ResourceNotFound:
-                    self.report_not_found('VOLUME SNAPSHOT', name)
-                except Exception as e:
-                    self.report_error('VOLUME SNAPSHOT', name, str(e))
-        except KeyError:
-            pass
+        # Volumes and snapshots are all independent; parallelize each group.
+        run_in_parallel(
+            list(self.resources.get('volumes', {}).items()),
+            self._delete_volume, self.parallelism,
+        )
+        run_in_parallel(
+            list(self.resources.get('volume_snapshots', {}).items()),
+            self._delete_snapshot, self.parallelism,
+        )
 
 class ComputeCleaner(AbstractCleaner):
-    def __init__(self, sess, resources, dryrun):
+    def __init__(self, sess, resources, dryrun, parallelism=1):
         self.conn = openstack.connection.Connection(session=sess)
         
         def instances_fetcher():
@@ -448,8 +587,10 @@ class ComputeCleaner(AbstractCleaner):
             'keypairs': [keypairs_fetcher]
         }
         
-        super(ComputeCleaner, self).__init__('Compute', res_desc, resources, dryrun)
+        super(ComputeCleaner, self).__init__('Compute', res_desc, resources, dryrun, parallelism)
         self.claimed_fip_ids = None
+        # Guards the shared ``deleting_instances`` dict mutated from delete/poll workers.
+        self._deleting_lock = threading.Lock()
 
     def set_claimed_floating_ips(self, id_set):
         self.claimed_fip_ids = id_set
@@ -459,27 +600,36 @@ class ComputeCleaner(AbstractCleaner):
             for port in self.conn.network.ports(device_id=instance_id):
                 release_floating_ips_on_port(
                     self.conn, port.id, self.dryrun, self.claimed_fip_ids,
-                    self.report_deletion, self.report_not_found, self.report_error)
+                    self.report_deletion, self.report_not_found, self.report_error,
+                    fip_index=self.fip_index)
         except Exception as e:
-            print(f'    . Could not list Neutron ports for instance {instance_id}: {e}')
+            log(f'    . Could not list Neutron ports for instance {instance_id}: {e}')
+
+    def _delete_instance(self, item, deleting_instances):
+        ins_id, ins_name = item
+        try:
+            self.conn.compute.get_server(ins_id)
+            self._release_floating_ips_for_instance(ins_id)
+            if self.dryrun:
+                self.report_deletion('INSTANCE', ins_name)
+            else:
+                self.conn.compute.delete_server(ins_id)
+        except os_exceptions.ResourceNotFound:
+            with self._deleting_lock:
+                deleting_instances.pop(ins_id, None)
+            self.report_not_found('INSTANCE', ins_name)
+        except Exception as e:
+            self.report_error('INSTANCE', ins_name, str(e))
 
     def clean(self):
         print('*** COMPUTE cleanup')
 
-        deleting_instances = dict(self.resources['instances'])
-        for ins_id, ins_name in self.resources['instances'].items():
-            try:
-                self.conn.compute.get_server(ins_id)
-                self._release_floating_ips_for_instance(ins_id)
-                if self.dryrun:
-                    self.report_deletion('INSTANCE', ins_name)
-                else:
-                    self.conn.compute.delete_server(ins_id)
-            except os_exceptions.ResourceNotFound:
-                deleting_instances.pop(ins_id, None)
-                self.report_not_found('INSTANCE', ins_name)
-            except Exception as e:
-                self.report_error('INSTANCE', ins_name, str(e))
+        deleting_instances = dict(self.resources.get('instances', {}))
+        run_in_parallel(
+            list(self.resources.get('instances', {}).items()),
+            lambda item: self._delete_instance(item, deleting_instances),
+            self.parallelism,
+        )
 
         if not self.dryrun and deleting_instances:
             self._wait_for_instance_deletion(deleting_instances)
@@ -487,44 +637,67 @@ class ComputeCleaner(AbstractCleaner):
         self._clean_keypairs()
 
     def _wait_for_instance_deletion(self, deleting_instances):
-        """Wait for instances to finish deleting - sometimes they take a while."""
+        """Wait for instances to finish deleting - sometimes they take a while.
+
+        Each polling round issues one ``get_server`` per still-deleting instance.
+        We fan those reads out across the thread pool so a 500-node cluster doesn't
+        serialize 500 GETs per iteration.
+        """
         print(f'    . Waiting for {len(deleting_instances)} instances to be fully deleted...')
         retry_count = DEFAULT_INSTANCE_DELETE_RETRIES  # Don't wait forever
-        
+
+        def _check_one(ins_id):
+            try:
+                self.conn.compute.get_server(ins_id)
+            except os_exceptions.ResourceNotFound:
+                with self._deleting_lock:
+                    ins_name = deleting_instances.pop(ins_id, None)
+                if ins_name is not None:
+                    self.report_deletion('INSTANCE', ins_name)
+            except Exception:
+                # Transient errors: leave it for the next round.
+                pass
+
         while deleting_instances and retry_count > 0:
             retry_count -= 1
             instances_to_check = list(deleting_instances.keys())
-            
-            for ins_id in instances_to_check:
-                try:
-                    self.conn.compute.get_server(ins_id)
-                except os_exceptions.ResourceNotFound:
-                    ins_name = deleting_instances.pop(ins_id)
-                    self.report_deletion('INSTANCE', ins_name)
-            
+            run_in_parallel(instances_to_check, _check_one, self.parallelism)
             if deleting_instances and retry_count > 0:
                 time.sleep(2)
-        
+
         if deleting_instances:
             print(f'    . Warning: {len(deleting_instances)} instances may still be deleting')
 
+    def _delete_keypair(self, item):
+        _keypair_id, keypair_name = item
+        try:
+            if not self.dryrun:
+                self.conn.compute.delete_keypair(keypair_name)
+            self.report_deletion('KEYPAIR', keypair_name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('KEYPAIR', keypair_name)
+        except Exception as e:
+            self.report_error('KEYPAIR', keypair_name, str(e))
+
     def _clean_keypairs(self):
         """Clean up keypairs."""
-        for keypair_id, keypair_name in self.resources['keypairs'].items():
-            try:
-                if self.dryrun:
-                    self.report_deletion('KEYPAIR', keypair_name)
-                else:
-                    self.conn.compute.delete_keypair(keypair_name)
-                    self.report_deletion('KEYPAIR', keypair_name)
-            except os_exceptions.ResourceNotFound:
-                self.report_not_found('KEYPAIR', keypair_name)
-            except Exception as e:
-                self.report_error('KEYPAIR', keypair_name, str(e))
+        run_in_parallel(
+            list(self.resources.get('keypairs', {}).items()),
+            self._delete_keypair, self.parallelism,
+        )
 
 class NetworkCleaner(AbstractCleaner):
 
-    def __init__(self, sess, resources, dryrun):
+    _PORT_SKIP_OWNERS = frozenset([
+        'network:router_interface', 'network:dhcp', 'network:router_gateway',
+    ])
+    _NETWORK_PORT_SKIP_OWNERS = frozenset([
+        'network:dhcp', 'network:router_interface',
+        'network:router_gateway', 'network:floatingip',
+        'network:ha_router_replicated_interface',
+    ])
+
+    def __init__(self, sess, resources, dryrun, parallelism=1):
         self.conn = openstack.connection.Connection(session=sess)
         
         def networks_fetcher():
@@ -541,7 +714,7 @@ class NetworkCleaner(AbstractCleaner):
             'networks': [networks_fetcher],
             'routers': [routers_fetcher]
         }
-        super(NetworkCleaner, self).__init__('Network', res_desc, resources, dryrun)
+        super(NetworkCleaner, self).__init__('Network', res_desc, resources, dryrun, parallelism)
         self.claimed_fip_ids = None
 
     def set_claimed_floating_ips(self, id_set):
@@ -550,7 +723,8 @@ class NetworkCleaner(AbstractCleaner):
     def _release_fips_on_port(self, port_id):
         release_floating_ips_on_port(
             self.conn, port_id, self.dryrun, self.claimed_fip_ids,
-            self.report_deletion, self.report_not_found, self.report_error)
+            self.report_deletion, self.report_not_found, self.report_error,
+            fip_index=self.fip_index)
 
     def remove_router_interface(self, router_id, port):
         """Clean up router interface the hard way."""
@@ -562,197 +736,199 @@ class NetworkCleaner(AbstractCleaner):
         except Exception:
             pass
 
+    def _delete_matching_port(self, port):
+        port_id = port.id
+        port_name = port.name
+        try:
+            device_owner = port.device_owner
+            # System ports are owned by their parent (router/DHCP/gateway) and are
+            # cleaned up when the parent is deleted; trying to delete them via the
+            # port API fails.
+            if device_owner in self._PORT_SKIP_OWNERS:
+                log(f'    . Skipping {device_owner} port {port_name}')
+                return
+            self._release_fips_on_port(port_id)
+            if not self.dryrun:
+                self.conn.network.delete_port(port_id)
+            self.report_deletion('PORT', port_name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('PORT', port_name)
+        except Exception as e:
+            self.report_error('PORT', port_name, str(e))
+
+    def _delete_router(self, item):
+        rid, name = item
+        try:
+            if self.dryrun:
+                self.conn.network.get_router(rid)
+                port_list = list(self.conn.network.ports(device_id=rid))
+                for port in port_list:
+                    self._release_fips_on_port(port.id)
+                self.report_deletion('Router Gateway', name)
+                for port in port_list:
+                    if port.fixed_ips:
+                        self.report_deletion('Router Interface', port.fixed_ips[0]['ip_address'])
+            else:
+                router = self.conn.network.get_router(rid)
+                log(f'    . Releasing floating IPs on ports for router {name}...')
+                port_list = list(self.conn.network.ports(device_id=rid))
+                # Release FIPs on this router's ports in parallel; they're independent.
+                run_in_parallel(
+                    [p.id for p in port_list],
+                    self._release_fips_on_port, self.parallelism,
+                )
+
+                if port_list or router.external_gateway_info:
+                    log('    . Waiting for floating IPs to be fully released...')
+                    time.sleep(DEFAULT_ROUTER_FIP_WAIT)
+
+                if router.external_gateway_info:
+                    try:
+                        self.conn.network.update_router(rid, external_gateway_info=None)
+                        self.report_deletion('Router Gateway', name)
+                    except Exception as e:
+                        log(f'    . Could not remove router gateway: {str(e)}')
+
+                # Re-list after gateway removal to catch any residual interfaces.
+                port_list = list(self.conn.network.ports(device_id=rid))
+
+                def _remove_iface(port):
+                    if not port.fixed_ips:
+                        return
+                    try:
+                        self.conn.network.remove_interface_from_router(
+                            rid, subnet_id=port.fixed_ips[0]['subnet_id']
+                        )
+                    except Exception:
+                        pass  # Interface may already be removed.
+
+                run_in_parallel(port_list, _remove_iface, self.parallelism)
+
+                self.conn.network.delete_router(rid)
+            self.report_deletion('ROUTER', name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('ROUTER', name)
+        except os_exceptions.ConflictException as e:
+            self.report_error('ROUTER', name, f'Conflict (may have dependencies): {str(e)}')
+        except Exception as e:
+            self.report_error('ROUTER', name, str(e))
+
+    def _delete_network(self, item):
+        nid, name = item
+        retry_count = 3
+        while retry_count > 0:
+            try:
+                if self.dryrun:
+                    self.conn.network.get_network(nid)
+                    self.report_deletion('NETWORK', name)
+                    return
+                # Clean up any residual ports we can (skip system-owned ones).
+                try:
+                    remaining_ports = list(self.conn.network.ports(network_id=nid))
+                    if remaining_ports:
+                        log(f'    . Network {name} has {len(remaining_ports)} remaining ports, checking...')
+
+                        def _delete_residual(port):
+                            owner = port.device_owner or ''
+                            if (owner in self._NETWORK_PORT_SKIP_OWNERS
+                                    or owner.startswith('network:router')
+                                    or owner.startswith('network:ha_router')):
+                                return
+                            try:
+                                self._release_fips_on_port(port.id)
+                                log(f'    . Deleting remaining port {port.name or port.id}...')
+                                self.conn.network.delete_port(port.id)
+                            except Exception as e:
+                                log(f'    . Could not delete port {port.id}: {str(e)}')
+
+                        run_in_parallel(remaining_ports, _delete_residual, self.parallelism)
+                except Exception as e:
+                    log(f'    . Could not check network ports: {str(e)}')
+
+                self.conn.network.delete_network(nid)
+                self.report_deletion('NETWORK', name)
+                return
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('NETWORK', name)
+                return
+            except os_exceptions.ConflictException as e:
+                retry_count -= 1
+                if retry_count > 0:
+                    log(f'    . Network {name} still has dependencies, retrying in 5 seconds... ({retry_count} retries left)')
+                    time.sleep(5)
+                else:
+                    self.report_error('NETWORK', name, f'Still has dependencies after retries: {str(e)}')
+                    return
+            except Exception as e:
+                self.report_error('NETWORK', name, str(e))
+                return
+
+    def _delete_security_group(self, item):
+        sgid, name = item
+        retry_count = 3
+        while retry_count > 0:
+            try:
+                if self.dryrun:
+                    self.conn.network.get_security_group(sgid)
+                else:
+                    self.conn.network.delete_security_group(sgid)
+                self.report_deletion('SECURITY GROUP', name)
+                return
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('SECURITY GROUP', name)
+                return
+            except os_exceptions.ConflictException as e:
+                retry_count -= 1
+                if retry_count > 0:
+                    log(f'    . Security group {name} still in use, retrying in 5 seconds... ({retry_count} retries left)')
+                    time.sleep(5)
+                else:
+                    self.report_error('SECURITY GROUP', name, f'Still in use after retries: {str(e)}')
+                    return
+            except Exception as e:
+                self.report_error('SECURITY GROUP', name, str(e))
+                return
+
     def clean(self):
         print('*** NETWORK cleanup')
         global resource_name_re
 
-        # Store security groups for later (delete them last)
-        security_groups_to_delete = []
+        # The between-step order (ports -> routers -> networks -> security groups)
+        # is preserved; only the work within each step is parallelized.
+        security_groups_to_delete = list(self.resources.get('sec_groups', {}).items())
 
-        try:
-            for id, name in self.resources['sec_groups'].items():
-                security_groups_to_delete.append((id, name))
-        except KeyError:
-            pass
-
-        # Ports matching the filter: release any floating IPs on those ports, then delete the port
+        # Ports matching the filter.
         try:
             all_ports = list(self.conn.network.ports())
-                
-            for port in all_ports:
-                port_id = port.id
-                port_name = port.name
-                
-                # Does this port match what we're looking for?
-                if resource_name_re.search(str(port_name)) or resource_name_re.search(str(port_id)):
-                    try:
-                        device_owner = port.device_owner
-                        
-                        # Skip system ports (they get handled by their parent resources)
-                        if device_owner not in ['network:router_interface', 'network:dhcp', 'network:router_gateway']:
-                            self._release_fips_on_port(port_id)
-                            if self.dryrun:
-                                self.report_deletion('PORT', port_name)
-                            else:
-                                self.conn.network.delete_port(port_id)
-                                self.report_deletion('PORT', port_name)
-                        else:
-                            print(f'    . Skipping {device_owner} port {port_name}')
-                    except os_exceptions.ResourceNotFound:
-                        self.report_not_found('PORT', port_name)
-                    except Exception as e:
-                        self.report_error('PORT', port_name, str(e))
+            matching_ports = [
+                p for p in all_ports
+                if resource_name_re.search(str(p.name)) or resource_name_re.search(str(p.id))
+            ]
+            run_in_parallel(matching_ports, self._delete_matching_port, self.parallelism)
         except Exception as e:
             print(f'    . Could not list ports: {str(e)}')
 
-        try:
-            for id, name in self.resources['routers'].items():
-                try:
-                    if self.dryrun:
-                        self.conn.network.get_router(id)
-                        port_list = list(self.conn.network.ports(device_id=id))
-                        for port in port_list:
-                            self._release_fips_on_port(port.id)
-                        self.report_deletion('Router Gateway', name)
-                        for port in port_list:
-                            if port.fixed_ips:
-                                self.report_deletion('Router Interface', port.fixed_ips[0]['ip_address'])
-                    else:
-                        router = self.conn.network.get_router(id)
-                        print(f'    . Releasing floating IPs on ports for router {name}...')
-                        port_list = list(self.conn.network.ports(device_id=id))
-                        for port in port_list:
-                            self._release_fips_on_port(port.id)
+        run_in_parallel(
+            list(self.resources.get('routers', {}).items()),
+            self._delete_router, self.parallelism,
+        )
+        run_in_parallel(
+            list(self.resources.get('networks', {}).items()),
+            self._delete_network, self.parallelism,
+        )
 
-                        if port_list or router.external_gateway_info:
-                            print('    . Waiting for floating IPs to be fully released...')
-                            time.sleep(DEFAULT_ROUTER_FIP_WAIT)
-                        
-                        # Now remove the gateway (should work better without floating IPs)
-                        if router.external_gateway_info:
-                            try:
-                                self.conn.network.update_router(id, external_gateway_info=None)
-                                self.report_deletion('Router Gateway', name)
-                            except Exception as e:
-                                print(f'    . Could not remove router gateway: {str(e)}')
-                                # Keep going anyway
-                        
-                        # Remove interfaces
-                        port_list = list(self.conn.network.ports(device_id=id))
-                            
-                        for port in port_list:
-                            # For SDK, remove interfaces by subnet
-                            if port.fixed_ips:
-                                try:
-                                    self.conn.network.remove_interface_from_router(
-                                        id, subnet_id=port.fixed_ips[0]['subnet_id']
-                                    )
-                                except Exception:
-                                    pass  # Interface might already be removed
-                        
-                        # Delete the router
-                        self.conn.network.delete_router(id)
-                    self.report_deletion('ROUTER', name)
-                except os_exceptions.ResourceNotFound:
-                    self.report_not_found('ROUTER', name)
-                except os_exceptions.ConflictException as e:
-                    self.report_error('ROUTER', name, f'Conflict (may have dependencies): {str(e)}')
-                except Exception as e:
-                    self.report_error('ROUTER', name, str(e))
-        except KeyError:
-            pass
-        try:
-            for id, name in self.resources['networks'].items():
-                retry_count = 3
-                while retry_count > 0:
-                    try:
-                        if self.dryrun:
-                            self.conn.network.get_network(id)
-                            self.report_deletion('NETWORK', name)
-                            break
-                        else:
-                            # Let's see what ports are still hanging around and clean up what we can
-                            try:
-                                remaining_ports = list(self.conn.network.ports(network_id=id))
-                                if remaining_ports:
-                                    print(f'    . Network {name} has {len(remaining_ports)} remaining ports, checking...')
-                                    for port in remaining_ports:
-                                        # Skip ports owned by router/DHCP/FIP (cannot be deleted via port API)
-                                        skip_owners = [
-                                            'network:dhcp', 'network:router_interface',
-                                            'network:router_gateway', 'network:floatingip',
-                                            'network:ha_router_replicated_interface',
-                                        ]
-                                        if port.device_owner in skip_owners:
-                                            continue
-                                        if (port.device_owner or '').startswith('network:router') or \
-                                           (port.device_owner or '').startswith('network:ha_router'):
-                                            continue
-                                        try:
-                                            self._release_fips_on_port(port.id)
-                                            print(f'    . Deleting remaining port {port.name or port.id}...')
-                                            self.conn.network.delete_port(port.id)
-                                        except Exception as e:
-                                            print(f'    . Could not delete port {port.id}: {str(e)}')
-                            except Exception as e:
-                                print(f'    . Could not check network ports: {str(e)}')
-                            
-                            self.conn.network.delete_network(id)
-                            self.report_deletion('NETWORK', name)
-                            break
-                    except os_exceptions.ResourceNotFound:
-                        self.report_not_found('NETWORK', name)
-                        break
-                    except os_exceptions.ConflictException as e:
-                        retry_count -= 1
-                        if retry_count > 0:
-                            print(f'    . Network {name} still has dependencies, retrying in 5 seconds... ({retry_count} retries left)')
-                            time.sleep(5)
-                        else:
-                            self.report_error('NETWORK', name, f'Still has dependencies after retries: {str(e)}')
-                            break
-                    except Exception as e:
-                        self.report_error('NETWORK', name, str(e))
-                        break
-        except KeyError:
-            pass
-
-        # Delete security groups last (after instances are gone)
         if security_groups_to_delete:
             if not self.dryrun:
                 print('    . Waiting a moment for instances to be fully deleted...')
-                time.sleep(5)  # Give instances time to be fully deleted
-            
-            for id, name in security_groups_to_delete:
-                retry_count = 3
-                while retry_count > 0:
-                    try:
-                        if self.dryrun:
-                            self.conn.network.get_security_group(id)
-                            self.report_deletion('SECURITY GROUP', name)
-                            break
-                        else:
-                            self.conn.network.delete_security_group(id)
-                            self.report_deletion('SECURITY GROUP', name)
-                            break
-                    except os_exceptions.ResourceNotFound:
-                        self.report_not_found('SECURITY GROUP', name)
-                        break
-                    except os_exceptions.ConflictException as e:
-                        retry_count -= 1
-                        if retry_count > 0:
-                            print(f'    . Security group {name} still in use, retrying in 5 seconds... ({retry_count} retries left)')
-                            time.sleep(5)
-                        else:
-                            self.report_error('SECURITY GROUP', name, f'Still in use after retries: {str(e)}')
-                            break
-                    except Exception as e:
-                        self.report_error('SECURITY GROUP', name, str(e))
-                        break
+                time.sleep(5)
+            run_in_parallel(
+                security_groups_to_delete,
+                self._delete_security_group, self.parallelism,
+            )
 
 class LoadBalancerCleaner(AbstractCleaner):
 
-    def __init__(self, sess, resources, dryrun):
+    def __init__(self, sess, resources, dryrun, parallelism=1):
         self.session = sess
         self.monitor = None  # Will be set by OpenStackCleaners
         
@@ -765,7 +941,7 @@ class LoadBalancerCleaner(AbstractCleaner):
         res_desc = {
             'loadbalancers': [loadbalancers_fetcher]
         }
-        super(LoadBalancerCleaner, self).__init__('LoadBalancer', res_desc, resources, dryrun)
+        super(LoadBalancerCleaner, self).__init__('LoadBalancer', res_desc, resources, dryrun, parallelism)
         self.claimed_fip_ids = None
 
     def set_monitor(self, monitor):
@@ -775,78 +951,73 @@ class LoadBalancerCleaner(AbstractCleaner):
     def set_claimed_floating_ips(self, id_set):
         self.claimed_fip_ids = id_set
 
-    def clean(self):
-        print('*** LOAD BALANCER cleanup')
-        
-        # For Load Balancers, it's often better to delete the entire LB with cascade
-        # This avoids issues with individual component deletion when LB is in PENDING_UPDATE state
-        
-        # Delete load balancers first with cascade - this should take care of listeners and pools too
-        try:
-            for id, name in self.resources.get('loadbalancers', {}).items():
-                retry_count = DEFAULT_RETRY_COUNT
-                while retry_count > 0:
+    def _delete_loadbalancer(self, item):
+        lb_id, name = item
+        retry_count = DEFAULT_RETRY_COUNT
+        while retry_count > 0:
+            try:
+                if self.dryrun:
                     try:
-                        if self.dryrun:
-                            try:
-                                lb = self.conn.load_balancer.get_load_balancer(id)
-                                release_floating_ips_on_port(
-                                    self.conn, lb.vip_port_id, True, self.claimed_fip_ids,
-                                    self.report_deletion, self.report_not_found, self.report_error)
-                            except os_exceptions.ResourceNotFound:
-                                pass
-                            except Exception as e:
-                                print(f'    . Could not inspect load balancer {name} for VIP floating IPs (dryrun): {e}')
-                            self.report_deletion('LOAD BALANCER', name)
-                            break
-                        else:
-                            try:
-                                lb = self.conn.load_balancer.get_load_balancer(id)
-                                if lb.provisioning_status in ['PENDING_UPDATE', 'PENDING_CREATE', 'PENDING_DELETE']:
-                                    print(f'    . Load balancer {name} is in {lb.provisioning_status} state, waiting...')
-                                    retry_count -= 1
-                                    if retry_count > 0:
-                                        time.sleep(DEFAULT_LB_RETRY_DELAY)
-                                        continue
-                                    else:
-                                        self.report_error('LOAD BALANCER', name, f'Still in {lb.provisioning_status} state after retries')
-                                        break
-                                release_floating_ips_on_port(
-                                    self.conn, lb.vip_port_id, False, self.claimed_fip_ids,
-                                    self.report_deletion, self.report_not_found, self.report_error)
-                            except os_exceptions.ResourceNotFound:
-                                self.report_not_found('LOAD BALANCER', name)
-                                break
-
-                            self.conn.load_balancer.delete_load_balancer(id, cascade=True)
-                            self.report_deletion('LOAD BALANCER', name)
-                            
-                            # Double check it's really gone if we have a monitor
-                            if self.monitor:
-                                self.monitor.verify_resource_deleted('LOAD BALANCER', id)
-                            break
-                            
+                        lb = self.conn.load_balancer.get_load_balancer(lb_id)
+                        release_floating_ips_on_port(
+                            self.conn, lb.vip_port_id, True, self.claimed_fip_ids,
+                            self.report_deletion, self.report_not_found, self.report_error,
+                            fip_index=self.fip_index)
                     except os_exceptions.ResourceNotFound:
-                        self.report_not_found('LOAD BALANCER', name)
-                        break
-                    except os_exceptions.ConflictException as e:
+                        pass
+                    except Exception as e:
+                        log(f'    . Could not inspect load balancer {name} for VIP floating IPs (dryrun): {e}')
+                    self.report_deletion('LOAD BALANCER', name)
+                    return
+
+                try:
+                    lb = self.conn.load_balancer.get_load_balancer(lb_id)
+                    if lb.provisioning_status in ['PENDING_UPDATE', 'PENDING_CREATE', 'PENDING_DELETE']:
+                        log(f'    . Load balancer {name} is in {lb.provisioning_status} state, waiting...')
                         retry_count -= 1
                         if retry_count > 0:
-                            print(f'    . Load balancer {name} conflict, retrying in {DEFAULT_LB_RETRY_DELAY} seconds... ({retry_count} retries left)')
                             time.sleep(DEFAULT_LB_RETRY_DELAY)
-                        else:
-                            self.report_error('LOAD BALANCER', name, f'Conflict after retries: {str(e)}')
-                            break
-                    except Exception as e:
-                        self.report_error('LOAD BALANCER', name, str(e))
-                        break
-        except KeyError:
-            pass
+                            continue
+                        self.report_error('LOAD BALANCER', name, f'Still in {lb.provisioning_status} state after retries')
+                        return
+                    release_floating_ips_on_port(
+                        self.conn, lb.vip_port_id, False, self.claimed_fip_ids,
+                        self.report_deletion, self.report_not_found, self.report_error,
+                        fip_index=self.fip_index)
+                except os_exceptions.ResourceNotFound:
+                    self.report_not_found('LOAD BALANCER', name)
+                    return
+
+                self.conn.load_balancer.delete_load_balancer(lb_id, cascade=True)
+                self.report_deletion('LOAD BALANCER', name)
+                return
+            except os_exceptions.ResourceNotFound:
+                self.report_not_found('LOAD BALANCER', name)
+                return
+            except os_exceptions.ConflictException as e:
+                retry_count -= 1
+                if retry_count > 0:
+                    log(f'    . Load balancer {name} conflict, retrying in {DEFAULT_LB_RETRY_DELAY} seconds... ({retry_count} retries left)')
+                    time.sleep(DEFAULT_LB_RETRY_DELAY)
+                else:
+                    self.report_error('LOAD BALANCER', name, f'Conflict after retries: {str(e)}')
+                    return
+            except Exception as e:
+                self.report_error('LOAD BALANCER', name, str(e))
+                return
+
+    def clean(self):
+        print('*** LOAD BALANCER cleanup')
+        # Cascade-delete each LB independently; listeners/pools go with them.
+        run_in_parallel(
+            list(self.resources.get('loadbalancers', {}).items()),
+            self._delete_loadbalancer, self.parallelism,
+        )
 
 class DnsCleaner(AbstractCleaner):
     """Cleaner for DNS (Designate) zones."""
 
-    def __init__(self, sess, resources, dryrun):
+    def __init__(self, sess, resources, dryrun, parallelism=1):
         self.conn = openstack.connection.Connection(session=sess)
         res_desc = {}
         try:
@@ -854,32 +1025,33 @@ class DnsCleaner(AbstractCleaner):
             res_desc['dns_zones'] = [lambda c=self.conn: list(c.dns.zones())]
         except Exception:
             pass
-        super(DnsCleaner, self).__init__('DNS', res_desc, resources, dryrun)
+        super(DnsCleaner, self).__init__('DNS', res_desc, resources, dryrun, parallelism)
+
+    def _delete_zone(self, item):
+        zone_id, zone_name = item
+        try:
+            if not self.dryrun:
+                self.conn.dns.delete_zone(zone_id)
+            self.report_deletion('DNS ZONE', zone_name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('DNS ZONE', zone_name)
+        except Exception as e:
+            self.report_error('DNS ZONE', zone_name, str(e))
 
     def clean(self):
         if 'dns_zones' not in self.resources:
             return
         print('*** DNS (Designate) cleanup')
-        try:
-            for zone_id, zone_name in self.resources['dns_zones'].items():
-                try:
-                    if self.dryrun:
-                        self.report_deletion('DNS ZONE', zone_name)
-                    else:
-                        self.conn.dns.delete_zone(zone_id)
-                        self.report_deletion('DNS ZONE', zone_name)
-                except os_exceptions.ResourceNotFound:
-                    self.report_not_found('DNS ZONE', zone_name)
-                except Exception as e:
-                    self.report_error('DNS ZONE', zone_name, str(e))
-        except Exception as e:
-            print(f'    . Could not clean DNS zones: {str(e)}')
+        run_in_parallel(
+            list(self.resources['dns_zones'].items()),
+            self._delete_zone, self.parallelism,
+        )
 
 
 class HeatCleaner(AbstractCleaner):
     """Cleaner for Heat (orchestration) stacks."""
 
-    def __init__(self, sess, resources, dryrun):
+    def __init__(self, sess, resources, dryrun, parallelism=1):
         self.conn = openstack.connection.Connection(session=sess)
         res_desc = {}
         try:
@@ -893,41 +1065,50 @@ class HeatCleaner(AbstractCleaner):
             res_desc['heat_stacks'] = [stacks_fetcher]
         except Exception:
             pass
-        super(HeatCleaner, self).__init__('Heat', res_desc, resources, dryrun)
+        super(HeatCleaner, self).__init__('Heat', res_desc, resources, dryrun, parallelism)
+
+    def _delete_and_wait_stack(self, item):
+        # Each stack's ``get -> delete -> wait_for_delete`` sequence is independent
+        # of other stacks, so running the whole sequence per-worker gives maximum
+        # parallelism. ``wait_for_delete`` is what used to dominate runtime.
+        stack_id, stack_name = item
+        try:
+            if self.dryrun:
+                self.report_deletion('HEAT STACK', stack_name)
+                return
+            log(f'    . Deleting Heat stack {stack_name} and waiting for completion...')
+            stack = self.conn.orchestration.get_stack(stack_id)
+            self.conn.orchestration.delete_stack(stack)
+            self.conn.orchestration.wait_for_delete(stack)
+            self.report_deletion('HEAT STACK', stack_name)
+        except os_exceptions.ResourceNotFound:
+            self.report_not_found('HEAT STACK', stack_name)
+        except Exception as e:
+            self.report_error('HEAT STACK', stack_name, str(e))
 
     def clean(self):
         if 'heat_stacks' not in self.resources:
             return
         print('*** HEAT (orchestration) cleanup')
-        try:
-            for stack_id, stack_name in self.resources['heat_stacks'].items():
-                try:
-                    if self.dryrun:
-                        self.report_deletion('HEAT STACK', stack_name)
-                    else:
-                        print(f'    . Deleting Heat stack {stack_name} and waiting for completion...')
-                        stack = self.conn.orchestration.get_stack(stack_id)
-                        self.conn.orchestration.delete_stack(stack)
-                        self.conn.orchestration.wait_for_delete(stack)
-                        self.report_deletion('HEAT STACK', stack_name)
-                except os_exceptions.ResourceNotFound:
-                    self.report_not_found('HEAT STACK', stack_name)
-                except Exception as e:
-                    self.report_error('HEAT STACK', stack_name, str(e))
-        except Exception as e:
-            print(f'    . Could not clean Heat stacks: {str(e)}')
+        run_in_parallel(
+            list(self.resources['heat_stacks'].items()),
+            self._delete_and_wait_stack, self.parallelism,
+        )
 
 
-def collect_preview_floating_ip_rows(conn, cleaners):
+def collect_preview_floating_ip_rows(conn, cleaners, fip_index=None):
     """FIPs that cleanup will remove (same attachment rules as release), for the summary table."""
-    try:
-        fips_by_port = {}
-        for fip in conn.network.ips():
-            pid = getattr(fip, 'port_id', None)
-            if pid:
-                fips_by_port.setdefault(pid, []).append(fip)
-    except Exception:
-        return []
+    if fip_index is not None:
+        fips_by_port = fip_index.all_by_port()
+    else:
+        try:
+            fips_by_port = {}
+            for fip in conn.network.ips():
+                pid = getattr(fip, 'port_id', None)
+                if pid:
+                    fips_by_port.setdefault(pid, []).append(fip)
+        except Exception:
+            return []
 
     seen = set()
     rows = []
@@ -994,32 +1175,42 @@ CLEANER_TYPES = [
 
 class OpenStackCleaners():
 
-    def __init__(self, creds_obj, resources, dryrun, resource_types=None):
+    def __init__(self, creds_obj, resources, dryrun, resource_types=None,
+                 parallelism=DEFAULT_PARALLELISM):
         """
         resource_types: if set, only run these cleaners (e.g. ['compute', 'network']).
         If None or empty, run all cleaners.
+        parallelism: max concurrent delete workers per resource type (1 == serial).
         """
         self.cleaners = []
         self.dryrun = dryrun
+        self.parallelism = max(1, int(parallelism))
         sess = creds_obj.get_session()
         self._session = sess
         self.monitor = ResourceMonitor(sess, dryrun)
-        claimed_floating_ip_ids = set()
+        # Thread-safe set shared across cleaners so they don't double-delete FIPs
+        # that happen to be reachable from multiple resources.
+        claimed_floating_ip_ids = ClaimedFloatingIPSet()
+        # Single FIP index built lazily on first use, shared across all cleaners
+        # and the preview step. Avoids listing all FIPs once per port.
+        self._preview_conn = openstack.connection.Connection(session=sess)
+        self.fip_index = FloatingIPIndex(self._preview_conn)
 
         types_set = set(resource_types) if resource_types else None
         for type_name, cleaner_class in CLEANER_TYPES:
             if types_set is not None and type_name not in types_set:
                 continue
-            cleaner = cleaner_class(sess, resources, dryrun)
+            cleaner = cleaner_class(sess, resources, dryrun, parallelism=self.parallelism)
             if hasattr(cleaner, 'set_monitor'):
                 cleaner.set_monitor(self.monitor)
             if hasattr(cleaner, 'set_claimed_floating_ips'):
                 cleaner.set_claimed_floating_ips(claimed_floating_ip_ids)
+            cleaner.set_fip_index(self.fip_index)
             self.cleaners.append(cleaner)
 
     def show_resources(self):
-        conn = openstack.connection.Connection(session=self._session)
-        fip_rows = collect_preview_floating_ip_rows(conn, self.cleaners)
+        fip_rows = collect_preview_floating_ip_rows(
+            self._preview_conn, self.cleaners, fip_index=self.fip_index)
         table = [["Resource type", "Name", "UUID"]]
         for cleaner in self.cleaners:
             table.extend(cleaner.get_resource_list())
@@ -1123,7 +1314,18 @@ def main():
                         help='limit cleanup to these types only (default: all). '
                              'Types: heat, dns, compute, storage, loadbalancer, network. '
                              'E.g. -t compute,network')
+    parser.add_argument('-p', '--parallelism', dest='parallelism',
+                        action='store', type=int, default=DEFAULT_PARALLELISM,
+                        metavar='N',
+                        help=f'max concurrent delete workers per resource type '
+                             f'(default: {DEFAULT_PARALLELISM}). Use 1 for serial '
+                             f'deletion. Increase for faster cleanup on large '
+                             f'deployments; decrease if the OpenStack API rate-limits.')
     opts = parser.parse_args()
+
+    if opts.parallelism < 1:
+        print('❌ ERROR: --parallelism must be >= 1')
+        return 1
 
     # Validate mutual exclusivity
     if opts.rc and opts.cloud:
@@ -1168,6 +1370,8 @@ def main():
         print(f"Types: {', '.join(resource_types)} (only these will be cleaned)")
     else:
         print("Types: all")
+    print(f"Parallelism: {opts.parallelism} workers per resource type"
+          + (" (serial)" if opts.parallelism == 1 else ""))
     print()
 
     cred = Credentials(opts.rc, opts.cloud)
@@ -1226,7 +1430,11 @@ def main():
         return 1
 
 
-    cleaners = OpenStackCleaners(cred, resources, opts.dryrun, resource_types=resource_types)
+    cleaners = OpenStackCleaners(
+        cred, resources, opts.dryrun,
+        resource_types=resource_types,
+        parallelism=opts.parallelism,
+    )
 
     if opts.dryrun:
         print()
