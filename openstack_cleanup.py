@@ -323,119 +323,6 @@ class Credentials:
 # Global regex pattern for matching resource names
 resource_name_re = None
 
-class ResourceMonitor:
-    """Watch resources being deleted and verify they're actually gone."""
-    
-    def __init__(self, session, dryrun=False):
-        self.session = session
-        self.dryrun = dryrun
-        
-        # Get our OpenStack connection
-        self.conn = openstack.connection.Connection(session=session)
-    
-    def verify_resource_deleted(self, resource_type, resource_id, max_attempts=10, delay=2):
-        """Double-check that a resource is actually gone."""
-        if self.dryrun:
-            return True
-            
-        print(f"    🔍 Verifying {resource_type} {resource_id[:8]}... deletion", end='', flush=True)
-        
-        for attempt in range(max_attempts):
-            try:
-                time.sleep(delay)
-                
-                # Try to get the resource - if it exists, it's not deleted yet
-                if resource_type.upper() in ['INSTANCE', 'SERVER']:
-                    self.conn.compute.get_server(resource_id)
-                elif resource_type.upper() == 'VOLUME':
-                    self.conn.block_storage.get_volume(resource_id)
-                elif resource_type.upper() == 'SNAPSHOT':
-                    self.conn.block_storage.get_snapshot(resource_id)
-                elif resource_type.upper() == 'NETWORK':
-                    self.conn.network.get_network(resource_id)
-                elif resource_type.upper() == 'ROUTER':
-                    self.conn.network.get_router(resource_id)
-                elif resource_type.upper() == 'PORT':
-                    self.conn.network.get_port(resource_id)
-                elif resource_type.upper() == 'SECURITY_GROUP':
-                    self.conn.network.get_security_group(resource_id)
-                elif resource_type.upper() == 'LOAD BALANCER':
-                    self.conn.load_balancer.get_load_balancer(resource_id)
-                # Still here? Resource exists, keep waiting
-                print('.', end='', flush=True)
-                
-            except os_exceptions.ResourceNotFound:
-                # Perfect! Resource is gone
-                print(' ✅ DELETED')
-                return True
-            except Exception as e:
-                # Something else happened, probably means it's gone
-                print(f' ⚠️  UNKNOWN ({str(e)[:30]}...)')
-                return True
-                
-        # Ran out of attempts
-        print(' ⏰ TIMEOUT (may still be deleting)')
-        return False
-    
-    def watch_bulk_deletion(self, resource_list, resource_type):
-        """Keep an eye on multiple resources being deleted at once."""
-        if self.dryrun or not resource_list:
-            return
-            
-        print(f"    🔍 Monitoring {len(resource_list)} {resource_type.lower()} deletion(s)...")
-        
-        remaining = list(resource_list)
-        start_time = time.time()
-        max_wait = 300  # Don't wait forever
-        
-        while remaining and (time.time() - start_time) < max_wait:
-            still_remaining = []
-            
-            for resource_id, resource_name in remaining:
-                try:
-                    # Check if each resource still exists
-                    if resource_type.upper() == 'LOAD BALANCER':
-                        self.conn.load_balancer.get_load_balancer(resource_id)
-                        still_remaining.append((resource_id, resource_name))
-                    elif resource_type.upper() in ['INSTANCE', 'SERVER']:
-                        self.conn.compute.get_server(resource_id)
-                        still_remaining.append((resource_id, resource_name))
-                    elif resource_type.upper() == 'NETWORK':
-                        self.conn.network.get_network(resource_id)
-                        still_remaining.append((resource_id, resource_name))
-                    elif resource_type.upper() == 'ROUTER':
-                        self.conn.network.get_router(resource_id)
-                        still_remaining.append((resource_id, resource_name))
-                    elif resource_type.upper() == 'PORT':
-                        self.conn.network.get_port(resource_id)
-                        still_remaining.append((resource_id, resource_name))
-                    elif resource_type.upper() == 'VOLUME':
-                        self.conn.block_storage.get_volume(resource_id)
-                        still_remaining.append((resource_id, resource_name))
-                        
-                except os_exceptions.ResourceNotFound:
-                    # Gone! Good news
-                    print(f"      ✅ {resource_name[:50]} - DELETED")
-                except Exception:
-                    # Can't access it, probably gone
-                    pass
-            
-            if len(still_remaining) != len(remaining):
-                print(f"      📊 {len(remaining) - len(still_remaining)} deleted, {len(still_remaining)} remaining")
-            
-            remaining = still_remaining
-            
-            if remaining:
-                time.sleep(3)
-        
-        if remaining:
-            print(f"      ⏰ Timeout: {len(remaining)} {resource_type.lower()}(s) may still be deleting")
-        else:
-            print(f"      🎉 All {resource_type.lower()}(s) successfully deleted!")
-
-# Global regex pattern gets set by main()
-resource_name_re = None
-
 def prompt_to_run(auto_approve=False):
     print("Warning: You didn't specify a resource list file as the input. "
           "The script will delete all resources shown above.")
@@ -1056,8 +943,7 @@ class LoadBalancerCleaner(AbstractCleaner):
     def __init__(self, sess, resources, dryrun, parallelism=1,
                  wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.session = sess
-        self.monitor = None  # Will be set by OpenStackCleaners
-        
+
         # Initialize OpenStack SDK connection
         self.conn = openstack.connection.Connection(session=sess)
         
@@ -1072,10 +958,6 @@ class LoadBalancerCleaner(AbstractCleaner):
             wait_timeout=wait_timeout, wait_interval=wait_interval,
         )
         self.claimed_fip_ids = None
-
-    def set_monitor(self, monitor):
-        """Hook up the progress monitor so we can track what's happening"""
-        self.monitor = monitor
 
     def set_claimed_floating_ips(self, id_set):
         self.claimed_fip_ids = id_set
@@ -1340,7 +1222,6 @@ class OpenStackCleaners():
         self.wait_interval = max(1, int(wait_interval))
         sess = creds_obj.get_session()
         self._session = sess
-        self.monitor = ResourceMonitor(sess, dryrun)
         # Thread-safe set shared across cleaners so they don't double-delete FIPs
         # that happen to be reachable from multiple resources.
         claimed_floating_ip_ids = ClaimedFloatingIPSet()
@@ -1359,8 +1240,6 @@ class OpenStackCleaners():
                 wait_timeout=self.wait_timeout,
                 wait_interval=self.wait_interval,
             )
-            if hasattr(cleaner, 'set_monitor'):
-                cleaner.set_monitor(self.monitor)
             if hasattr(cleaner, 'set_claimed_floating_ips'):
                 cleaner.set_claimed_floating_ips(claimed_floating_ip_ids)
             cleaner.set_fip_index(self.fip_index)
