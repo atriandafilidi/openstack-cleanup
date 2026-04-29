@@ -58,8 +58,12 @@ DEFAULT_RETRY_COUNT = 3
 DEFAULT_VOLUME_DETACH_EXTRA_RETRIES = 5
 DEFAULT_LB_RETRY_DELAY = 10
 DEFAULT_ROUTER_FIP_WAIT = 5
-DEFAULT_INSTANCE_DELETE_RETRIES = 30
 DEFAULT_PARALLELISM = 10
+# Verification of asynchronous deletes: each cleaner polls get_*() until the
+# resource raises ResourceNotFound or the timeout elapses. Tune via CLI flags
+# --wait-timeout / --wait-interval. Set --wait-timeout 0 to disable verification.
+DEFAULT_WAIT_TIMEOUT = 300
+DEFAULT_WAIT_INTERVAL = 2
 
 
 # Single lock for all stdout writes so parallel workers don't interleave log lines.
@@ -476,10 +480,14 @@ def build_resource_dict(res_list):
 
 class AbstractCleaner(metaclass=ABCMeta):
 
-    def __init__(self, res_category, res_desc, resources, dryrun, parallelism=1):
+    def __init__(self, res_category, res_desc, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.dryrun = dryrun
         self.category = res_category
         self.parallelism = max(1, int(parallelism))
+        self.wait_timeout = max(0, int(wait_timeout))
+        self.wait_interval = max(1, int(wait_interval))
+        self._wait_lock = threading.Lock()
         self.resources = {}
         self.fip_index = None  # Set via set_fip_index() before clean().
         if not resources:
@@ -505,6 +513,52 @@ class AbstractCleaner(metaclass=ABCMeta):
     def report_error(self, rtype, name, reason):
         log(f'    - {rtype} {name} ERROR: {reason}')
 
+    def report_verified(self, rtype, name):
+        log(f'    ✓ {rtype} {name} confirmed deleted')
+
+    def _wait_until_gone(self, label, items, getter, on_gone=None):
+        """Poll ``getter(id)`` for each ``(id, name)`` in ``items`` until each one
+        either raises ``ResourceNotFound`` (confirmed deleted) or the configured
+        ``wait_timeout`` elapses.
+
+        Returns the list of ``(id, name)`` tuples that did NOT confirm deletion
+        (the "stragglers"). ``on_gone(label, name)`` is called once per
+        confirmed deletion; defaults to :meth:`report_verified`.
+        """
+        if self.dryrun or self.wait_timeout <= 0 or not items:
+            return []
+        if on_gone is None:
+            on_gone = self.report_verified
+        pending = dict(items)
+        deadline = time.time() + self.wait_timeout
+
+        def _check(rid):
+            try:
+                getter(rid)
+            except os_exceptions.ResourceNotFound:
+                with self._wait_lock:
+                    name = pending.pop(rid, None)
+                if name is not None:
+                    on_gone(label, name)
+            except Exception:
+                # Transient errors: leave it for the next round.
+                pass
+
+        while pending and time.time() < deadline:
+            run_in_parallel(list(pending.keys()), _check, self.parallelism)
+            if pending and time.time() < deadline:
+                time.sleep(self.wait_interval)
+        return list(pending.items())
+
+    def verify(self):
+        """Confirm targeted resources are actually gone.
+
+        Subclasses override this to poll ``get_*`` for each resource type they
+        manage. Returns a list of ``(rtype, id, name)`` for any resource that
+        did not disappear within ``wait_timeout`` seconds. Default: no-op.
+        """
+        return []
+
     def get_resource_list(self):
         result = []
         for rtype, rdict in self.resources.items():
@@ -517,7 +571,8 @@ class AbstractCleaner(metaclass=ABCMeta):
         pass
 
 class StorageCleaner(AbstractCleaner):
-    def __init__(self, sess, resources, dryrun, parallelism=1):
+    def __init__(self, sess, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.conn = openstack.connection.Connection(session=sess)
         
         def volumes_fetcher():
@@ -531,7 +586,10 @@ class StorageCleaner(AbstractCleaner):
             'volume_snapshots': [snapshots_fetcher]
         }
             
-        super(StorageCleaner, self).__init__('Storage', res_desc, resources, dryrun, parallelism)
+        super(StorageCleaner, self).__init__(
+            'Storage', res_desc, resources, dryrun, parallelism,
+            wait_timeout=wait_timeout, wait_interval=wait_interval,
+        )
 
     def _delete_volume(self, item):
         vid, name = item
@@ -572,8 +630,26 @@ class StorageCleaner(AbstractCleaner):
             self._delete_snapshot, self.parallelism,
         )
 
+    def verify(self):
+        stragglers = []
+        remaining = self._wait_until_gone(
+            'VOLUME',
+            list(self.resources.get('volumes', {}).items()),
+            self.conn.block_storage.get_volume,
+        )
+        stragglers.extend(('volumes', rid, name) for rid, name in remaining)
+        remaining = self._wait_until_gone(
+            'VOLUME SNAPSHOT',
+            list(self.resources.get('volume_snapshots', {}).items()),
+            self.conn.block_storage.get_snapshot,
+        )
+        stragglers.extend(('volume_snapshots', rid, name) for rid, name in remaining)
+        return stragglers
+
+
 class ComputeCleaner(AbstractCleaner):
-    def __init__(self, sess, resources, dryrun, parallelism=1):
+    def __init__(self, sess, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.conn = openstack.connection.Connection(session=sess)
         
         def instances_fetcher():
@@ -587,10 +663,17 @@ class ComputeCleaner(AbstractCleaner):
             'keypairs': [keypairs_fetcher]
         }
         
-        super(ComputeCleaner, self).__init__('Compute', res_desc, resources, dryrun, parallelism)
+        super(ComputeCleaner, self).__init__(
+            'Compute', res_desc, resources, dryrun, parallelism,
+            wait_timeout=wait_timeout, wait_interval=wait_interval,
+        )
         self.claimed_fip_ids = None
         # Guards the shared ``deleting_instances`` dict mutated from delete/poll workers.
         self._deleting_lock = threading.Lock()
+        # Instances we asked Nova to delete but couldn't confirm gone within the
+        # wait timeout. Surfaced via ``verify()`` so the parent run can report
+        # / fail strictly.
+        self._instance_stragglers = {}
 
     def set_claimed_floating_ips(self, id_set):
         self.claimed_fip_ids = id_set
@@ -634,6 +717,9 @@ class ComputeCleaner(AbstractCleaner):
         if not self.dryrun and deleting_instances:
             self._wait_for_instance_deletion(deleting_instances)
 
+        # Snapshot stragglers so verify() can re-check / report them.
+        self._instance_stragglers = dict(deleting_instances)
+
         self._clean_keypairs()
 
     def _wait_for_instance_deletion(self, deleting_instances):
@@ -641,32 +727,30 @@ class ComputeCleaner(AbstractCleaner):
 
         Each polling round issues one ``get_server`` per still-deleting instance.
         We fan those reads out across the thread pool so a 500-node cluster doesn't
-        serialize 500 GETs per iteration.
+        serialize 500 GETs per iteration. Bounded by ``--wait-timeout`` /
+        ``--wait-interval`` (see :data:`DEFAULT_WAIT_TIMEOUT`).
         """
-        print(f'    . Waiting for {len(deleting_instances)} instances to be fully deleted...')
-        retry_count = DEFAULT_INSTANCE_DELETE_RETRIES  # Don't wait forever
+        if self.wait_timeout <= 0:
+            print(f'    . Skipping instance deletion wait (--wait-timeout 0); '
+                  f'{len(deleting_instances)} delete requests issued.')
+            return
+        print(f'    . Waiting up to {self.wait_timeout}s for {len(deleting_instances)} '
+              f'instances to be fully deleted...')
 
-        def _check_one(ins_id):
-            try:
-                self.conn.compute.get_server(ins_id)
-            except os_exceptions.ResourceNotFound:
-                with self._deleting_lock:
-                    ins_name = deleting_instances.pop(ins_id, None)
-                if ins_name is not None:
-                    self.report_deletion('INSTANCE', ins_name)
-            except Exception:
-                # Transient errors: leave it for the next round.
-                pass
+        items = list(deleting_instances.items())
+        remaining = self._wait_until_gone(
+            'INSTANCE', items, self.conn.compute.get_server,
+            on_gone=self.report_deletion,
+        )
+        # Sync ``deleting_instances`` so the caller observes the post-wait state.
+        with self._deleting_lock:
+            deleting_instances.clear()
+            for rid, name in remaining:
+                deleting_instances[rid] = name
 
-        while deleting_instances and retry_count > 0:
-            retry_count -= 1
-            instances_to_check = list(deleting_instances.keys())
-            run_in_parallel(instances_to_check, _check_one, self.parallelism)
-            if deleting_instances and retry_count > 0:
-                time.sleep(2)
-
-        if deleting_instances:
-            print(f'    . Warning: {len(deleting_instances)} instances may still be deleting')
+        if remaining:
+            print(f'    . Warning: {len(remaining)} instances may still be deleting '
+                  f'(timeout {self.wait_timeout}s; tune via --wait-timeout)')
 
     def _delete_keypair(self, item):
         _keypair_id, keypair_name = item
@@ -686,6 +770,20 @@ class ComputeCleaner(AbstractCleaner):
             self._delete_keypair, self.parallelism,
         )
 
+    def verify(self):
+        # Instances were already polled inside ``clean()``; re-check stragglers
+        # in case they finished after we gave up. Keypairs are synchronous, so
+        # we trust the delete response.
+        if not self._instance_stragglers:
+            return []
+        remaining = self._wait_until_gone(
+            'INSTANCE',
+            list(self._instance_stragglers.items()),
+            self.conn.compute.get_server,
+        )
+        return [('instances', rid, name) for rid, name in remaining]
+
+
 class NetworkCleaner(AbstractCleaner):
 
     _PORT_SKIP_OWNERS = frozenset([
@@ -697,7 +795,8 @@ class NetworkCleaner(AbstractCleaner):
         'network:ha_router_replicated_interface',
     ])
 
-    def __init__(self, sess, resources, dryrun, parallelism=1):
+    def __init__(self, sess, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.conn = openstack.connection.Connection(session=sess)
         
         def networks_fetcher():
@@ -714,7 +813,10 @@ class NetworkCleaner(AbstractCleaner):
             'networks': [networks_fetcher],
             'routers': [routers_fetcher]
         }
-        super(NetworkCleaner, self).__init__('Network', res_desc, resources, dryrun, parallelism)
+        super(NetworkCleaner, self).__init__(
+            'Network', res_desc, resources, dryrun, parallelism,
+            wait_timeout=wait_timeout, wait_interval=wait_interval,
+        )
         self.claimed_fip_ids = None
 
     def set_claimed_floating_ips(self, id_set):
@@ -926,9 +1028,33 @@ class NetworkCleaner(AbstractCleaner):
                 self._delete_security_group, self.parallelism,
             )
 
+    def verify(self):
+        stragglers = []
+        remaining = self._wait_until_gone(
+            'NETWORK',
+            list(self.resources.get('networks', {}).items()),
+            self.conn.network.get_network,
+        )
+        stragglers.extend(('networks', rid, name) for rid, name in remaining)
+        remaining = self._wait_until_gone(
+            'ROUTER',
+            list(self.resources.get('routers', {}).items()),
+            self.conn.network.get_router,
+        )
+        stragglers.extend(('routers', rid, name) for rid, name in remaining)
+        remaining = self._wait_until_gone(
+            'SECURITY GROUP',
+            list(self.resources.get('sec_groups', {}).items()),
+            self.conn.network.get_security_group,
+        )
+        stragglers.extend(('sec_groups', rid, name) for rid, name in remaining)
+        return stragglers
+
+
 class LoadBalancerCleaner(AbstractCleaner):
 
-    def __init__(self, sess, resources, dryrun, parallelism=1):
+    def __init__(self, sess, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.session = sess
         self.monitor = None  # Will be set by OpenStackCleaners
         
@@ -941,7 +1067,10 @@ class LoadBalancerCleaner(AbstractCleaner):
         res_desc = {
             'loadbalancers': [loadbalancers_fetcher]
         }
-        super(LoadBalancerCleaner, self).__init__('LoadBalancer', res_desc, resources, dryrun, parallelism)
+        super(LoadBalancerCleaner, self).__init__(
+            'LoadBalancer', res_desc, resources, dryrun, parallelism,
+            wait_timeout=wait_timeout, wait_interval=wait_interval,
+        )
         self.claimed_fip_ids = None
 
     def set_monitor(self, monitor):
@@ -1014,10 +1143,20 @@ class LoadBalancerCleaner(AbstractCleaner):
             self._delete_loadbalancer, self.parallelism,
         )
 
+    def verify(self):
+        remaining = self._wait_until_gone(
+            'LOAD BALANCER',
+            list(self.resources.get('loadbalancers', {}).items()),
+            self.conn.load_balancer.get_load_balancer,
+        )
+        return [('loadbalancers', rid, name) for rid, name in remaining]
+
+
 class DnsCleaner(AbstractCleaner):
     """Cleaner for DNS (Designate) zones."""
 
-    def __init__(self, sess, resources, dryrun, parallelism=1):
+    def __init__(self, sess, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.conn = openstack.connection.Connection(session=sess)
         res_desc = {}
         try:
@@ -1025,7 +1164,10 @@ class DnsCleaner(AbstractCleaner):
             res_desc['dns_zones'] = [lambda c=self.conn: list(c.dns.zones())]
         except Exception:
             pass
-        super(DnsCleaner, self).__init__('DNS', res_desc, resources, dryrun, parallelism)
+        super(DnsCleaner, self).__init__(
+            'DNS', res_desc, resources, dryrun, parallelism,
+            wait_timeout=wait_timeout, wait_interval=wait_interval,
+        )
 
     def _delete_zone(self, item):
         zone_id, zone_name = item
@@ -1051,7 +1193,8 @@ class DnsCleaner(AbstractCleaner):
 class HeatCleaner(AbstractCleaner):
     """Cleaner for Heat (orchestration) stacks."""
 
-    def __init__(self, sess, resources, dryrun, parallelism=1):
+    def __init__(self, sess, resources, dryrun, parallelism=1,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT, wait_interval=DEFAULT_WAIT_INTERVAL):
         self.conn = openstack.connection.Connection(session=sess)
         res_desc = {}
         try:
@@ -1065,7 +1208,10 @@ class HeatCleaner(AbstractCleaner):
             res_desc['heat_stacks'] = [stacks_fetcher]
         except Exception:
             pass
-        super(HeatCleaner, self).__init__('Heat', res_desc, resources, dryrun, parallelism)
+        super(HeatCleaner, self).__init__(
+            'Heat', res_desc, resources, dryrun, parallelism,
+            wait_timeout=wait_timeout, wait_interval=wait_interval,
+        )
 
     def _delete_and_wait_stack(self, item):
         # Each stack's ``get -> delete -> wait_for_delete`` sequence is independent
@@ -1176,15 +1322,22 @@ CLEANER_TYPES = [
 class OpenStackCleaners():
 
     def __init__(self, creds_obj, resources, dryrun, resource_types=None,
-                 parallelism=DEFAULT_PARALLELISM):
+                 parallelism=DEFAULT_PARALLELISM,
+                 wait_timeout=DEFAULT_WAIT_TIMEOUT,
+                 wait_interval=DEFAULT_WAIT_INTERVAL):
         """
         resource_types: if set, only run these cleaners (e.g. ['compute', 'network']).
         If None or empty, run all cleaners.
         parallelism: max concurrent delete workers per resource type (1 == serial).
+        wait_timeout: max seconds to poll each resource group for confirmed
+            deletion (0 disables verification).
+        wait_interval: seconds between poll rounds.
         """
         self.cleaners = []
         self.dryrun = dryrun
         self.parallelism = max(1, int(parallelism))
+        self.wait_timeout = max(0, int(wait_timeout))
+        self.wait_interval = max(1, int(wait_interval))
         sess = creds_obj.get_session()
         self._session = sess
         self.monitor = ResourceMonitor(sess, dryrun)
@@ -1200,7 +1353,12 @@ class OpenStackCleaners():
         for type_name, cleaner_class in CLEANER_TYPES:
             if types_set is not None and type_name not in types_set:
                 continue
-            cleaner = cleaner_class(sess, resources, dryrun, parallelism=self.parallelism)
+            cleaner = cleaner_class(
+                sess, resources, dryrun,
+                parallelism=self.parallelism,
+                wait_timeout=self.wait_timeout,
+                wait_interval=self.wait_interval,
+            )
             if hasattr(cleaner, 'set_monitor'):
                 cleaner.set_monitor(self.monitor)
             if hasattr(cleaner, 'set_claimed_floating_ips'):
@@ -1229,6 +1387,25 @@ class OpenStackCleaners():
     def clean(self):
         for cleaner in self.cleaners:
             cleaner.clean()
+
+    def verify_all(self):
+        """Confirm every targeted resource is actually gone.
+
+        Returns a list of ``(rtype, id, name)`` tuples for resources that did
+        not disappear within ``wait_timeout`` seconds. Each cleaner is
+        responsible for polling its own resource types.
+        """
+        if self.dryrun or self.wait_timeout <= 0:
+            return []
+        stragglers = []
+        print()
+        print('*** VERIFY deletions')
+        for cleaner in self.cleaners:
+            try:
+                stragglers.extend(cleaner.verify())
+            except Exception as e:
+                log(f'    . Verification error in {cleaner.category}: {e}')
+        return stragglers
 
 # Here's how we store what needs to be cleaned up:
 # First level keys are service types: keypairs, users, routers, instances,
@@ -1321,10 +1498,32 @@ def main():
                              f'(default: {DEFAULT_PARALLELISM}). Use 1 for serial '
                              f'deletion. Increase for faster cleanup on large '
                              f'deployments; decrease if the OpenStack API rate-limits.')
+    parser.add_argument('--wait-timeout', dest='wait_timeout',
+                        action='store', type=int, default=DEFAULT_WAIT_TIMEOUT,
+                        metavar='SECONDS',
+                        help=f'max seconds to poll each resource group for '
+                             f'confirmed deletion (default: {DEFAULT_WAIT_TIMEOUT}). '
+                             f'Set to 0 to disable verification entirely.')
+    parser.add_argument('--wait-interval', dest='wait_interval',
+                        action='store', type=int, default=DEFAULT_WAIT_INTERVAL,
+                        metavar='SECONDS',
+                        help=f'seconds between deletion-verification poll rounds '
+                             f'(default: {DEFAULT_WAIT_INTERVAL}).')
+    parser.add_argument('--wait-strict', dest='wait_strict',
+                        action='store_true', default=False,
+                        help='exit with code 2 if any resource is not confirmed '
+                             'gone within --wait-timeout, otherwise stragglers '
+                             'are only warned about (default: false).')
     opts = parser.parse_args()
 
     if opts.parallelism < 1:
         print('❌ ERROR: --parallelism must be >= 1')
+        return 1
+    if opts.wait_timeout < 0:
+        print('❌ ERROR: --wait-timeout must be >= 0')
+        return 1
+    if opts.wait_interval < 1:
+        print('❌ ERROR: --wait-interval must be >= 1')
         return 1
 
     # Validate mutual exclusivity
@@ -1372,6 +1571,12 @@ def main():
         print("Types: all")
     print(f"Parallelism: {opts.parallelism} workers per resource type"
           + (" (serial)" if opts.parallelism == 1 else ""))
+    if opts.wait_timeout > 0:
+        print(f"Verification: poll up to {opts.wait_timeout}s "
+              f"(every {opts.wait_interval}s) per resource group"
+              + (" [STRICT: exit 2 on stragglers]" if opts.wait_strict else ""))
+    else:
+        print("Verification: DISABLED (--wait-timeout 0)")
     print()
 
     cred = Credentials(opts.rc, opts.cloud)
@@ -1434,6 +1639,8 @@ def main():
         cred, resources, opts.dryrun,
         resource_types=resource_types,
         parallelism=opts.parallelism,
+        wait_timeout=opts.wait_timeout,
+        wait_interval=opts.wait_interval,
     )
 
     if opts.dryrun:
@@ -1453,17 +1660,35 @@ def main():
         prompt_to_run(opts.auto_approve)
 
     cleaners.clean()
-    
-    # Let them know how it went
+
+    stragglers = []
+    if not opts.dryrun and opts.wait_timeout > 0:
+        stragglers = cleaners.verify_all()
+
     print()
     if opts.dryrun:
         print("✅ Dry run completed successfully!")
         print(f"   Found {count} resources that would be deleted.")
         print("   To actually delete these resources, run the same command without --dryrun")
-    else:
-        print("✅ Cleanup completed!")
-        print(f"   Processed {count} resources.")
-    
+        return 0
+
+    if stragglers:
+        print(f"⚠️  Cleanup finished with {len(stragglers)} unverified resource(s) "
+              f"(still present after --wait-timeout {opts.wait_timeout}s):")
+        table = [["Resource type", "Name", "UUID"]]
+        for rtype, rid, name in stragglers:
+            table.append([rtype, name, rid])
+        print(tabulate(table, headers="firstrow", tablefmt="psql"))
+        print("   Re-run the script to retry, raise --wait-timeout, or "
+              "investigate dependencies blocking deletion.")
+        if opts.wait_strict:
+            return 2
+        return 0
+
+    print("✅ Cleanup completed!")
+    print(f"   Processed {count} resources.")
+    if opts.wait_timeout > 0:
+        print("   All targeted resources confirmed deleted.")
     return 0
 
 
