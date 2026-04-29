@@ -58,7 +58,7 @@ DEFAULT_RETRY_COUNT = 3
 DEFAULT_VOLUME_DETACH_EXTRA_RETRIES = 5
 DEFAULT_LB_RETRY_DELAY = 10
 DEFAULT_ROUTER_FIP_WAIT = 5
-DEFAULT_PARALLELISM = 10
+DEFAULT_PARALLEL = 10
 # Verification of asynchronous deletes: each cleaner polls get_*() until the
 # resource raises ResourceNotFound or the timeout elapses. Tune via CLI flags
 # --wait-timeout / --wait-interval. Set --wait-timeout 0 to disable verification.
@@ -1204,7 +1204,7 @@ CLEANER_TYPES = [
 class OpenStackCleaners():
 
     def __init__(self, creds_obj, resources, dryrun, resource_types=None,
-                 parallelism=DEFAULT_PARALLELISM,
+                 parallelism=DEFAULT_PARALLEL,
                  wait_timeout=DEFAULT_WAIT_TIMEOUT,
                  wait_interval=DEFAULT_WAIT_INTERVAL):
         """
@@ -1370,11 +1370,11 @@ def main():
                         help='limit cleanup to these types only (default: all). '
                              'Types: heat, dns, compute, storage, loadbalancer, network. '
                              'E.g. -t compute,network')
-    parser.add_argument('-p', '--parallelism', dest='parallelism',
-                        action='store', type=int, default=DEFAULT_PARALLELISM,
+    parser.add_argument('-p', '--parallel', dest='parallel',
+                        action='store', type=int, default=DEFAULT_PARALLEL,
                         metavar='N',
                         help=f'max concurrent delete workers per resource type '
-                             f'(default: {DEFAULT_PARALLELISM}). Use 1 for serial '
+                             f'(default: {DEFAULT_PARALLEL}). Use 1 for serial '
                              f'deletion. Increase for faster cleanup on large '
                              f'deployments; decrease if the OpenStack API rate-limits.')
     parser.add_argument('--wait-timeout', dest='wait_timeout',
@@ -1395,8 +1395,8 @@ def main():
                              'are only warned about (default: false).')
     opts = parser.parse_args()
 
-    if opts.parallelism < 1:
-        print('❌ ERROR: --parallelism must be >= 1')
+    if opts.parallel < 1:
+        print('❌ ERROR: --parallel must be >= 1')
         return 1
     if opts.wait_timeout < 0:
         print('❌ ERROR: --wait-timeout must be >= 0')
@@ -1448,8 +1448,8 @@ def main():
         print(f"Types: {', '.join(resource_types)} (only these will be cleaned)")
     else:
         print("Types: all")
-    print(f"Parallelism: {opts.parallelism} workers per resource type"
-          + (" (serial)" if opts.parallelism == 1 else ""))
+    print(f"Parallel (--parallel): {opts.parallel} workers per resource type"
+          + (" (serial)" if opts.parallel == 1 else ""))
     if opts.wait_timeout > 0:
         print(f"Verification: poll up to {opts.wait_timeout}s "
               f"(every {opts.wait_interval}s) per resource group"
@@ -1517,7 +1517,7 @@ def main():
     cleaners = OpenStackCleaners(
         cred, resources, opts.dryrun,
         resource_types=resource_types,
-        parallelism=opts.parallelism,
+        parallelism=opts.parallel,
         wait_timeout=opts.wait_timeout,
         wait_interval=opts.wait_interval,
     )
