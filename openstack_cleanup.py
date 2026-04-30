@@ -405,8 +405,9 @@ class AbstractCleaner(metaclass=ABCMeta):
 
     def _wait_until_gone(self, label, items, getter, on_gone=None):
         """Poll ``getter(id)`` for each ``(id, name)`` in ``items`` until each one
-        either raises ``ResourceNotFound`` (confirmed deleted) or the configured
-        ``wait_timeout`` elapses.
+        is confirmed gone: ``ResourceNotFound``, a ``None`` return (some SDK paths
+        use ``ignore_missing``-style semantics), or the configured ``wait_timeout``
+        elapses.
 
         Returns the list of ``(id, name)`` tuples that did NOT confirm deletion
         (the "stragglers"). ``on_gone(label, name)`` is called once per
@@ -418,18 +419,31 @@ class AbstractCleaner(metaclass=ABCMeta):
             on_gone = self.report_verified
         pending = dict(items)
         deadline = time.time() + self.wait_timeout
+        # Log at most one error line per resource id per wait (parallel workers).
+        query_fail_logged = set()
+
+        def _gone(rid):
+            with self._wait_lock:
+                name = pending.pop(rid, None)
+            if name is not None:
+                on_gone(label, name)
 
         def _check(rid):
             try:
-                getter(rid)
+                obj = getter(rid)
             except os_exceptions.ResourceNotFound:
+                _gone(rid)
+                return
+            except Exception as e:
                 with self._wait_lock:
-                    name = pending.pop(rid, None)
-                if name is not None:
-                    on_gone(label, name)
-            except Exception:
-                # Transient errors: leave it for the next round.
-                pass
+                    if rid not in query_fail_logged:
+                        query_fail_logged.add(rid)
+                        hint = pending.get(rid, rid)
+                        log(f'    . Verification query failed for {label} '
+                            f'{hint!r} ({rid[:8]}…): {e}')
+                return
+            if obj is None:
+                _gone(rid)
 
         while pending and time.time() < deadline:
             run_in_parallel(list(pending.keys()), _check, self.parallelism)
@@ -507,30 +521,32 @@ class StorageCleaner(AbstractCleaner):
     def clean(self):
         print('*** STORAGE cleanup')
 
-        # Volumes and snapshots are all independent; parallelize each group.
-        run_in_parallel(
-            list(self.resources.get('volumes', {}).items()),
-            self._delete_volume, self.parallelism,
-        )
+        # Snapshots before volumes: Cinder often blocks volume delete until child
+        # snapshots are removed; parallelize within each group.
         run_in_parallel(
             list(self.resources.get('volume_snapshots', {}).items()),
             self._delete_snapshot, self.parallelism,
         )
+        run_in_parallel(
+            list(self.resources.get('volumes', {}).items()),
+            self._delete_volume, self.parallelism,
+        )
 
     def verify(self):
         stragglers = []
-        remaining = self._wait_until_gone(
-            'VOLUME',
-            list(self.resources.get('volumes', {}).items()),
-            self.conn.block_storage.get_volume,
-        )
-        stragglers.extend(('volumes', rid, name) for rid, name in remaining)
+        # Same order as clean(): snapshots first (dependents), then volumes.
         remaining = self._wait_until_gone(
             'VOLUME SNAPSHOT',
             list(self.resources.get('volume_snapshots', {}).items()),
             self.conn.block_storage.get_snapshot,
         )
         stragglers.extend(('volume_snapshots', rid, name) for rid, name in remaining)
+        remaining = self._wait_until_gone(
+            'VOLUME',
+            list(self.resources.get('volumes', {}).items()),
+            self.conn.block_storage.get_volume,
+        )
+        stragglers.extend(('volumes', rid, name) for rid, name in remaining)
         return stragglers
 
 
@@ -1270,21 +1286,25 @@ class OpenStackCleaners():
     def verify_all(self):
         """Confirm every targeted resource is actually gone.
 
-        Returns a list of ``(rtype, id, name)`` tuples for resources that did
-        not disappear within ``wait_timeout`` seconds. Each cleaner is
-        responsible for polling its own resource types.
+        Returns ``(stragglers, verify_errors)`` where *stragglers* is a list of
+        ``(rtype, id, name)`` tuples for resources still present after
+        ``wait_timeout``, and *verify_errors* is a list of ``(category, message)``
+        for cleaners whose ``verify()`` raised (so callers can fail strict runs).
         """
         if self.dryrun or self.wait_timeout <= 0:
-            return []
+            return [], []
         stragglers = []
+        verify_errors = []
         print()
         print('*** VERIFY deletions')
         for cleaner in self.cleaners:
             try:
                 stragglers.extend(cleaner.verify())
             except Exception as e:
+                msg = str(e)
+                verify_errors.append((cleaner.category, msg))
                 log(f'    . Verification error in {cleaner.category}: {e}')
-        return stragglers
+        return stragglers, verify_errors
 
 # Here's how we store what needs to be cleaned up:
 # First level keys are service types: keypairs, users, routers, instances,
@@ -1541,8 +1561,9 @@ def main():
     cleaners.clean()
 
     stragglers = []
+    verify_errors = []
     if not opts.dryrun and opts.wait_timeout > 0:
-        stragglers = cleaners.verify_all()
+        stragglers, verify_errors = cleaners.verify_all()
 
     print()
     if opts.dryrun:
@@ -1551,15 +1572,23 @@ def main():
         print("   To actually delete these resources, run the same command without --dryrun")
         return 0
 
-    if stragglers:
-        print(f"⚠️  Cleanup finished with {len(stragglers)} unverified resource(s) "
-              f"(still present after --wait-timeout {opts.wait_timeout}s):")
-        table = [["Resource type", "Name", "UUID"]]
-        for rtype, rid, name in stragglers:
-            table.append([rtype, name, rid])
-        print(tabulate(table, headers="firstrow", tablefmt="psql"))
+    if verify_errors or stragglers:
+        if verify_errors:
+            print(f"⚠️  Verification raised errors for {len(verify_errors)} cleaner(s) "
+                  f"(those categories could not be fully checked):")
+            err_table = [["Cleaner category", "Error"]]
+            for cat, err in verify_errors:
+                err_table.append([cat, err[:500]])
+            print(tabulate(err_table, headers="firstrow", tablefmt="psql"))
+        if stragglers:
+            print(f"⚠️  Cleanup finished with {len(stragglers)} unverified resource(s) "
+                  f"(still present after --wait-timeout {opts.wait_timeout}s):")
+            table = [["Resource type", "Name", "UUID"]]
+            for rtype, rid, name in stragglers:
+                table.append([rtype, name, rid])
+            print(tabulate(table, headers="firstrow", tablefmt="psql"))
         print("   Re-run the script to retry, raise --wait-timeout, or "
-              "investigate dependencies blocking deletion.")
+              "investigate dependencies / API errors.")
         if opts.wait_strict:
             return 2
         return 0
